@@ -64,6 +64,20 @@ _NO_TIME_RANGE_WARNING = (
 )
 
 
+# Field name fragments that strongly suggest an analyzed text type.
+# Keyword fields (agent.name, rule.id, data.srcip, etc.) don't match these.
+_TEXT_FIELD_HINTS = (
+    "description", "message", "full_log", "log", "content",
+    "text", "comment", "detail", "summary", "reason", "output",
+)
+
+
+def _is_likely_text_field(field: str) -> bool:
+    """Heuristic: true when the field name suggests an analyzed text type."""
+    last = field.rsplit(".", 1)[-1].lower()
+    return any(hint in last for hint in _TEXT_FIELD_HINTS)
+
+
 def _flatten_doc(doc: dict, prefix: str = "") -> dict:
     """Recursively flatten a nested document to dot-notation keys."""
     out = {}
@@ -499,9 +513,9 @@ class OpenSearchClient:
         result = self._post(f"/{index}/_search", body=body)
         buckets = result.get("aggregations", {}).get("top_values", {}).get("buckets", [])
         out = {b["key"]: b["doc_count"] for b in buckets}
-        if not field.endswith(".keyword"):
+        if _is_likely_text_field(field):
             out["_warning"] = (
-                f"Field '{field}' may be a text field. If results look wrong, "
+                f"Field '{field}' looks like a text field. If results look wrong, "
                 f"try '{field}.keyword' instead. Using text fields in aggregations "
                 "loads fielddata into heap memory."
             )
@@ -536,12 +550,12 @@ class OpenSearchClient:
                 result.get("aggregations", {}).get(a["id"], {}).get("buckets", [])
             )
             out[a["id"]] = {b["key"]: b["doc_count"] for b in buckets}
-        text_fields = [a["field"] for a in aggregations if not a["field"].endswith(".keyword")]
+        text_fields = [a["field"] for a in aggregations if _is_likely_text_field(a["field"])]
         if text_fields:
-            out["_warnings"] = [
-                f"Field '{f}' may be a text field — try '{f}.keyword' to avoid fielddata heap pressure."
+            out["_warning"] = " | ".join(
+                f"Field '{f}' looks like a text field — try '{f}.keyword' to avoid fielddata heap pressure."
                 for f in text_fields
-            ]
+            )
         return out
 
     @staticmethod
