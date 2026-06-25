@@ -18,6 +18,7 @@ from datetime import datetime, timezone
 
 import requests
 from requests.adapters import HTTPAdapter
+from requests.exceptions import HTTPError
 from urllib3.util.retry import Retry
 
 logger = logging.getLogger(__name__)
@@ -28,8 +29,9 @@ CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
 BACKEND_DASHBOARDS = "dashboards"
 BACKEND_OPENSEARCH = "opensearch"
 
-MAX_SEARCH_LIMIT = 200       # hard cap on search result size
-MAX_HISTOGRAM_BUCKETS = 2000 # reject histograms that would exceed this
+MAX_SEARCH_LIMIT = 200        # hard cap on search result size
+MAX_HISTOGRAM_BUCKETS = 2000  # reject histograms that would exceed this
+MAX_SAMPLE_SIZE = 100         # hard cap on discover_fields sample_size
 
 # Interval string → seconds
 _INTERVAL_SECONDS = {
@@ -55,6 +57,23 @@ _ALLOWED_PATHS = {
         "/api/console/proxy",   # Dashboards proxy (carries the real path)
     ],
 }
+
+_NO_TIME_RANGE_WARNING = (
+    "No time range specified — this query scans the full index history "
+    "and may be slow or expensive. Pass from_ts/to_ts to limit the scope."
+)
+
+
+def _flatten_doc(doc: dict, prefix: str = "") -> dict:
+    """Recursively flatten a nested document to dot-notation keys."""
+    out = {}
+    for k, v in doc.items():
+        full = f"{prefix}.{k}" if prefix else k
+        if isinstance(v, dict):
+            out.update(_flatten_doc(v, prefix=full))
+        else:
+            out[full] = type(v).__name__
+    return out
 
 
 class OpenSearchClient:
@@ -121,6 +140,32 @@ class OpenSearchClient:
                 "Only search, count, mapping, and discovery calls are permitted."
             )
 
+    # ── Structured error handling ─────────────────────────────
+
+    @staticmethod
+    def _raise_for_status(r, context: str):
+        """Re-raise HTTP errors as clean RuntimeErrors with actionable messages."""
+        try:
+            r.raise_for_status()
+        except HTTPError:
+            status = r.status_code
+            if status == 403:
+                raise RuntimeError(
+                    f"Permission denied: {context}. "
+                    "The authenticated user lacks the required privilege."
+                ) from None
+            if status == 404:
+                raise RuntimeError(
+                    f"Not found: {context}. "
+                    "Check the index name or Dashboards version."
+                ) from None
+            if status == 400:
+                raise RuntimeError(
+                    f"Bad request: {context}. "
+                    "Check your query syntax or field names."
+                ) from None
+            raise RuntimeError(f"HTTP {status}: {context}.") from None
+
     # ── Backend resolution ────────────────────────────────────
 
     def _resolve_backend(self):
@@ -158,7 +203,7 @@ class OpenSearchClient:
                     verify=self.verify_ssl,
                     timeout=10,
                 )
-                r.raise_for_status()
+                self._raise_for_status(r, "GET /")
                 data = r.json()
                 self.backend = BACKEND_OPENSEARCH
                 self.server_version = data.get("version", {}).get("number", "?")
@@ -188,7 +233,7 @@ class OpenSearchClient:
             verify=self.verify_ssl,
             timeout=self.timeout,
         )
-        r.raise_for_status()
+        self._raise_for_status(r, f"GET {path}")
         self.last_query_ms = int(r.elapsed.total_seconds() * 1000)
         return r.json()
 
@@ -204,7 +249,7 @@ class OpenSearchClient:
             verify=self.verify_ssl,
             timeout=self.timeout,
         )
-        r.raise_for_status()
+        self._raise_for_status(r, f"POST {path}")
         self.last_query_ms = int(r.elapsed.total_seconds() * 1000)
         return r.json()
 
@@ -224,7 +269,7 @@ class OpenSearchClient:
             verify=self.verify_ssl,
             timeout=self.timeout,
         )
-        r.raise_for_status()
+        self._raise_for_status(r, f"{method} {path} (via Dashboards proxy)")
         self.last_query_ms = int(r.elapsed.total_seconds() * 1000)
         return r.json()
 
@@ -268,7 +313,7 @@ class OpenSearchClient:
     # ── Public read-only API ──────────────────────────────────
 
     def test_connection(self) -> dict:
-        """Probe connectivity. Returns backend, version, and URL."""
+        """Probe connectivity. Returns backend, version, URL, and authenticated username."""
         self._resolve_backend()
         return {
             "ok": True,
@@ -279,6 +324,7 @@ class OpenSearchClient:
                 if self.backend == BACKEND_DASHBOARDS
                 else self.opensearch_url
             ),
+            "username": self._session.auth[0] if self._session.auth else None,
         }
 
     def cluster_health(self) -> dict:
@@ -310,7 +356,7 @@ class OpenSearchClient:
             verify=self.verify_ssl,
             timeout=self.timeout,
         )
-        r.raise_for_status()
+        self._raise_for_status(r, "GET /api/saved_objects/_find (index patterns)")
         data = r.json()
         saved_objects = data.get("saved_objects", [])
         return [
@@ -339,21 +385,30 @@ class OpenSearchClient:
         ts_field: str = "@timestamp",
         sample_size: int = 10,
     ) -> dict:
-        """Sample documents and return {field_name: python_type}."""
+        """Sample documents and return {field_name: python_type} in dot-notation.
+
+        Nested fields are flattened: agent.name, rule.level, etc.
+        sample_size is capped at MAX_SAMPLE_SIZE to prevent large fetches.
+        """
+        capped = min(sample_size, MAX_SAMPLE_SIZE)
         result = self.search_string(
             index,
             query_string=query_string,
             from_ts=from_ts,
             to_ts=to_ts,
             ts_field=ts_field,
-            limit=sample_size,
+            limit=capped,
         )
         fields = {}
         for hit in result.get("hits", []):
-            for k, v in hit.items():
-                if k not in fields:
-                    fields[k] = type(v).__name__
-        return fields
+            fields.update(_flatten_doc(hit))
+        out = dict(sorted(fields.items()))
+        if capped < sample_size:
+            out["_warning"] = (
+                f"sample_size capped at {capped} (requested {sample_size}). "
+                f"Maximum is {MAX_SAMPLE_SIZE}."
+            )
+        return out
 
     def search_string(
         self,
@@ -367,7 +422,10 @@ class OpenSearchClient:
         sort_dir: str = "desc",
         source_fields: list = None,
     ) -> dict:
-        """Search with a Lucene query string. Returns {"total": N, "hits": [...]}."""
+        """Search with a Lucene query string. Returns {"total": N, "hits": [...]}.
+
+        Adds a "warning" key when limit is capped or no time range is given.
+        """
         capped = min(limit, self.max_search_limit)
         q = self._qs_query(query_string, from_ts, to_ts, ts_field)
         body = {
@@ -386,11 +444,16 @@ class OpenSearchClient:
             "total": total,
             "hits": [h.get("_source", {}) for h in hits.get("hits", [])],
         }
+        warnings = []
         if capped < limit:
-            out["warning"] = (
+            warnings.append(
                 f"limit capped at {capped} (requested {limit}). "
                 "Use source_fields to reduce response size, or paginate with multiple calls."
             )
+        if not from_ts and not to_ts:
+            warnings.append(_NO_TIME_RANGE_WARNING)
+        if warnings:
+            out["warning"] = " | ".join(warnings)
         return out
 
     def count(
@@ -400,11 +463,17 @@ class OpenSearchClient:
         from_ts: str = None,
         to_ts: str = None,
         ts_field: str = "@timestamp",
-    ) -> int:
-        """Count documents matching a query."""
+    ) -> dict:
+        """Count documents matching a query. Returns {"count": N}.
+
+        Adds a "warning" key when no time range is given (full-index scan).
+        """
         q = self._qs_query(query_string, from_ts, to_ts, ts_field)
         result = self._post(f"/{index}/_count", body={"query": q})
-        return result.get("count", 0)
+        out = {"count": result.get("count", 0)}
+        if not from_ts and not to_ts:
+            out["warning"] = _NO_TIME_RANGE_WARNING
+        return out
 
     def terms(
         self,
@@ -416,7 +485,11 @@ class OpenSearchClient:
         ts_field: str = "@timestamp",
         size: int = 50,
     ) -> dict:
-        """Top N values of a field. Returns {value: count} sorted descending."""
+        """Top N values of a field. Returns {value: count} sorted descending.
+
+        Adds a "warning" key when the field may be a text field (no .keyword suffix),
+        which triggers fielddata and loads heap memory on the cluster.
+        """
         q = self._qs_query(query_string, from_ts, to_ts, ts_field)
         body = {
             "size": 0,
@@ -425,7 +498,14 @@ class OpenSearchClient:
         }
         result = self._post(f"/{index}/_search", body=body)
         buckets = result.get("aggregations", {}).get("top_values", {}).get("buckets", [])
-        return {b["key"]: b["doc_count"] for b in buckets}
+        out = {b["key"]: b["doc_count"] for b in buckets}
+        if not field.endswith(".keyword"):
+            out["_warning"] = (
+                f"Field '{field}' may be a text field. If results look wrong, "
+                f"try '{field}.keyword' instead. Using text fields in aggregations "
+                "loads fielddata into heap memory."
+            )
+        return out
 
     def multi_terms(
         self,
@@ -440,7 +520,10 @@ class OpenSearchClient:
 
         aggregations: [{"id": "...", "field": "...", "size": N}, ...]
         Returns {id: {value: count}}.
+        Adds "_warnings" key listing any fields that may cause fielddata heap pressure.
         """
+        if not aggregations:
+            raise ValueError("aggregations list must not be empty.")
         q = self._qs_query(query_string, from_ts, to_ts, ts_field)
         aggs = {
             a["id"]: {"terms": {"field": a["field"], "size": a.get("size", 50)}}
@@ -453,6 +536,12 @@ class OpenSearchClient:
                 result.get("aggregations", {}).get(a["id"], {}).get("buckets", [])
             )
             out[a["id"]] = {b["key"]: b["doc_count"] for b in buckets}
+        text_fields = [a["field"] for a in aggregations if not a["field"].endswith(".keyword")]
+        if text_fields:
+            out["_warnings"] = [
+                f"Field '{f}' may be a text field — try '{f}.keyword' to avoid fielddata heap pressure."
+                for f in text_fields
+            ]
         return out
 
     @staticmethod
@@ -588,12 +677,14 @@ def init_client() -> OpenSearchClient:
     """Initialise OpenSearchClient from env vars or config file.
 
     Env vars (priority over config file):
-        OPENSEARCH_DASHBOARDS_URL  — e.g. https://opensearch.example.com
-        OPENSEARCH_URL             — e.g. https://opensearch.example.com:9200 (fallback)
+        OPENSEARCH_DASHBOARDS_URL       — e.g. https://opensearch.example.com
+        OPENSEARCH_URL                  — e.g. https://opensearch.example.com:9200 (fallback)
         OPENSEARCH_USERNAME
         OPENSEARCH_PASSWORD
-        OPENSEARCH_VERIFY_SSL      — "true"/"false" (default: true)
-        OPENSEARCH_TIMEOUT         — seconds (default: 60)
+        OPENSEARCH_VERIFY_SSL           — "true"/"false" (default: true)
+        OPENSEARCH_TIMEOUT              — seconds (default: 60)
+        OPENSEARCH_MAX_SEARCH_LIMIT     — hard cap on search results (default: 200)
+        OPENSEARCH_MAX_HISTOGRAM_BUCKETS — hard cap on histogram buckets (default: 2000)
     """
     try:
         from dotenv import load_dotenv
