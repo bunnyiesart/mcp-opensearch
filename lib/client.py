@@ -526,8 +526,8 @@ def init_client() -> OpenSearchClient:
     """Initialise OpenSearchClient from env vars or config file.
 
     Env vars (priority over config file):
-        OPENSEARCH_DASHBOARDS_URL  — e.g. https://siem.bsdtrust.com
-        OPENSEARCH_URL             — e.g. https://siem.bsdtrust.com:9200 (fallback)
+        OPENSEARCH_DASHBOARDS_URL  — e.g. https://opensearch.example.com
+        OPENSEARCH_URL             — e.g. https://opensearch.example.com:9200 (fallback)
         OPENSEARCH_USERNAME
         OPENSEARCH_PASSWORD
         OPENSEARCH_VERIFY_SSL      — "true"/"false" (default: true)

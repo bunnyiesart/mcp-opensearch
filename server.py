@@ -16,8 +16,8 @@ Exposes:
   opensearch_stats               — numeric stats for a field
 
 Credentials (env vars or ~/.config/mcp-opensearch/config.json):
-  OPENSEARCH_DASHBOARDS_URL  — tried first (e.g. https://siem.bsdtrust.com)
-  OPENSEARCH_URL             — direct fallback (e.g. https://siem.bsdtrust.com:9200)
+  OPENSEARCH_DASHBOARDS_URL  — tried first (e.g. https://opensearch.example.com)
+  OPENSEARCH_URL             — direct fallback (e.g. https://opensearch.example.com:9200)
   OPENSEARCH_USERNAME
   OPENSEARCH_PASSWORD
   OPENSEARCH_VERIFY_SSL      — "true"/"false" (default: true)

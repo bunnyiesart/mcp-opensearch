@@ -37,8 +37,8 @@ echo ""
 echo "Creating $CONFIG_FILE"
 echo ""
 
-read -p "OpenSearch Dashboards URL (e.g. https://siem.bsdtrust.com) [leave blank to skip]: " DASHBOARDS_URL
-read -p "Direct OpenSearch URL (e.g. https://siem.bsdtrust.com:9200) [leave blank to skip]: " OPENSEARCH_URL
+read -p "OpenSearch Dashboards URL (e.g. https://opensearch.example.com) [leave blank to skip]: " DASHBOARDS_URL
+read -p "Direct OpenSearch URL (e.g. https://opensearch.example.com:9200) [leave blank to skip]: " OPENSEARCH_URL
 
 if [ -z "$DASHBOARDS_URL" ] && [ -z "$OPENSEARCH_URL" ]; then
     echo "Error: at least one URL is required." >&2
@@ -75,9 +75,9 @@ PYEOF
 chmod 600 "$CONFIG_FILE"
 echo "Config saved to $CONFIG_FILE (chmod 600)"
 echo ""
-echo "Or use env vars in /home/gabriel/.config/bluearmory/.env:"
-echo "  OPENSEARCH_DASHBOARDS_URL=https://siem.bsdtrust.com"
-echo "  OPENSEARCH_URL=https://siem.bsdtrust.com:9200"
+echo "Or use env vars (e.g. in a .env file):"
+echo "  OPENSEARCH_DASHBOARDS_URL=https://opensearch.example.com"
+echo "  OPENSEARCH_URL=https://opensearch.example.com:9200"
 echo "  OPENSEARCH_USERNAME=..."
 echo "  OPENSEARCH_PASSWORD=..."
 echo "  OPENSEARCH_VERIFY_SSL=true"

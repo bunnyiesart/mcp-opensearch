@@ -1,5 +1,5 @@
 IMAGE    := opensearch-mcp:dev
-ENV_FILE := $(HOME)/.config/bluearmory/.env
+ENV_FILE := $(HOME)/.config/mcp-opensearch/.env
 
 .PHONY: build run shell
 
