@@ -64,6 +64,10 @@ def opensearch_cluster_health() -> dict:
     Returns status (green/yellow/red), number of nodes, active shards, and
     unassigned shards. Useful to know if the backend is degraded before
     trusting query results.
+
+    Note: requires cluster:monitor/health privilege. Returns a permission error
+    if the authenticated user does not have this privilege — in that case, skip
+    this tool and use opensearch_test to confirm basic connectivity instead.
     """
     return get_client().cluster_health()
 
@@ -76,6 +80,11 @@ def opensearch_list_indices() -> list:
 
     Returns a list sorted by index name. Use this to find the right index name
     before querying (e.g. wazuh-alerts-4.x-2026.06.24).
+
+    Note: requires index-level read access via the Dashboards proxy
+    (_cat/indices privilege). Returns a permission error if the authenticated
+    user lacks this privilege — use opensearch_list_index_patterns as an
+    alternative to discover available index patterns.
     """
     return get_client().list_indices()
 
@@ -101,6 +110,11 @@ def opensearch_get_mapping(index: str) -> dict:
     Returns:
         {index_name: {field_path: field_type}} for all matched indices.
         Nested fields are flattened with dot notation (e.g. "rule.level": "integer").
+
+    Note: requires indices:admin/mappings/get privilege. Returns a permission
+    error if the authenticated user lacks this privilege — use
+    opensearch_discover_fields as an alternative (samples live documents to
+    infer field names and types).
     """
     return get_client().get_mapping(index)
 
@@ -150,6 +164,7 @@ def opensearch_search(
     to_ts: Optional[str] = None,
     ts_field: str = "@timestamp",
     limit: int = 50,
+    offset: int = 0,
     sort_field: Optional[str] = None,
     sort_dir: str = "desc",
     source_fields: Optional[list] = None,
@@ -165,11 +180,14 @@ def opensearch_search(
         from_ts: Start time, UTC ISO 8601, e.g. "2026-06-23T00:00:00Z".
         to_ts: End time, UTC ISO 8601, e.g. "2026-06-24T00:00:00Z".
         ts_field: Timestamp field name (default "@timestamp").
-        limit: Max documents to return (default 50).
+        limit: Max documents to return (default 50, hard cap 200).
+        offset: Pagination offset — skip this many documents before returning
+                results (default 0). Use with limit to page through large result
+                sets: offset=0 → page 1, offset=200 → page 2, etc.
         sort_field: Field to sort by (default: ts_field).
         sort_dir: "desc" = newest first (default), "asc" = oldest first.
         source_fields: Fields to include, e.g. ["agent.name", "rule.description"].
-                       Omit for all fields.
+                       Omit for all fields. Strongly recommended to reduce size.
 
     Returns:
         {"total": N, "hits": [doc, ...]}
@@ -181,6 +199,7 @@ def opensearch_search(
         to_ts=to_ts,
         ts_field=ts_field,
         limit=limit,
+        offset=offset,
         sort_field=sort_field,
         sort_dir=sort_dir,
         source_fields=source_fields,
