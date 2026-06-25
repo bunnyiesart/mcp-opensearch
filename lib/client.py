@@ -432,12 +432,14 @@ class OpenSearchClient:
         to_ts: str = None,
         ts_field: str = "@timestamp",
         limit: int = 50,
+        offset: int = 0,
         sort_field: str = None,
         sort_dir: str = "desc",
         source_fields: list = None,
     ) -> dict:
         """Search with a Lucene query string. Returns {"total": N, "hits": [...]}.
 
+        Use offset for pagination: offset=200 fetches the next page after the first 200.
         Adds a "warning" key when limit is capped or no time range is given.
         """
         capped = min(limit, self.max_search_limit)
@@ -445,6 +447,7 @@ class OpenSearchClient:
         body = {
             "query": q,
             "size": capped,
+            "from": max(offset, 0),
             "sort": [{(sort_field or ts_field): {"order": sort_dir}}],
         }
         if source_fields:
@@ -623,12 +626,18 @@ class OpenSearchClient:
             f"/{index}/_search",
             body={"size": 0, "query": q, "aggs": {"over_time": agg_spec}},
         )
-        buckets = result.get("aggregations", {}).get("over_time", {}).get("buckets", [])
+        agg_result = result.get("aggregations", {}).get("over_time", {})
+        buckets = agg_result.get("buckets", [])
+        # Resolve the actual interval used (relevant when interval="auto")
+        interval_used = interval
+        if interval == "auto" and buckets:
+            interval_used = agg_result.get("interval", "auto")
         return {
+            "interval_used": interval_used,
             "results": {
                 b.get("key_as_string", str(b["key"])): b["doc_count"]
                 for b in buckets
-            }
+            },
         }
 
     def stats(
@@ -647,7 +656,16 @@ class OpenSearchClient:
             "query": q,
             "aggs": {"field_stats": {"extended_stats": {"field": field}}},
         }
-        result = self._post(f"/{index}/_search", body=body)
+        try:
+            result = self._post(f"/{index}/_search", body=body)
+        except RuntimeError as exc:
+            if "Bad request" in str(exc):
+                raise RuntimeError(
+                    f"Field '{field}' is not numeric or does not support stats aggregation. "
+                    "Use a numeric field such as 'rule.level' or 'data.bytes'. "
+                    f"Original error: {exc}"
+                ) from None
+            raise
         st = result.get("aggregations", {}).get("field_stats", {})
         return {
             "count": st.get("count", 0),
@@ -742,8 +760,12 @@ def init_client() -> OpenSearchClient:
         max_search_limit=max_search_limit,
         max_histogram_buckets=max_histogram_buckets,
     )
+    # Warm the connection at startup so the first tool call doesn't pay the
+    # backend probe cost (~1.3s). Also surfaces config errors immediately.
+    client._resolve_backend()
     logger.info(
-        "OpenSearch client ready (dashboards=%s, direct=%s)",
+        "OpenSearch client ready (backend=%s, dashboards=%s, direct=%s)",
+        client.backend,
         dashboards_url or "none",
         opensearch_url or "none",
     )
