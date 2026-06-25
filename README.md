@@ -1,5 +1,21 @@
 # mcp-opensearch
 
+```
+           /\     /\
+          /  \___/  \
+         / (o)   (o) \
+        |   ~~ v ~~   |
+        |   `-----`   |         mcp-opensearch
+        |  /       \  |         ─────────────────────────────────────
+        | |    ─    | |         Read-only MCP server for
+         \|         |/          OpenSearch & OpenSearch Dashboards.
+          |         |           Fuzzy log hunting.
+         /|         |\
+        / |         | \
+       (  |         |  )~~~~~
+        \_|_________|_/     ~~
+```
+
 > Read-only MCP server for OpenSearch and OpenSearch Dashboards — search, aggregate, and explore your log data from Claude Code or any MCP-compatible AI assistant.
 
 ## Features
