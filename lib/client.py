@@ -12,7 +12,9 @@ import json
 import logging
 import os
 import posixpath
+import re
 import stat
+from datetime import datetime, timezone
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -26,6 +28,16 @@ CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
 BACKEND_DASHBOARDS = "dashboards"
 BACKEND_OPENSEARCH = "opensearch"
 
+MAX_SEARCH_LIMIT = 200       # hard cap on search result size
+MAX_HISTOGRAM_BUCKETS = 2000 # reject histograms that would exceed this
+
+# Interval string → seconds
+_INTERVAL_SECONDS = {
+    "s": 1, "m": 60, "h": 3600, "d": 86400,
+    "w": 604800, "M": 2592000, "y": 31536000,
+}
+_INTERVAL_RE = re.compile(r"^(\d+)([smhdwMy])$")
+
 # Read-only path allowlist — suffix match
 # e.g. /wazuh-alerts-*/_search matches "/_search"
 _ALLOWED_PATHS = {
@@ -34,7 +46,7 @@ _ALLOWED_PATHS = {
         "/_cluster/health",
         "/_mapping",
         "/api/status",
-        "/api/index_patterns/index_pattern",
+        "/api/saved_objects/_find",
     ],
     "POST": [
         "/_search",
@@ -60,11 +72,15 @@ class OpenSearchClient:
         password=None,
         verify_ssl=True,
         timeout=60,
+        max_search_limit=MAX_SEARCH_LIMIT,
+        max_histogram_buckets=MAX_HISTOGRAM_BUCKETS,
     ):
         self.dashboards_url = dashboards_url.rstrip("/") if dashboards_url else None
         self.opensearch_url = opensearch_url.rstrip("/") if opensearch_url else None
         self.verify_ssl = verify_ssl
         self.timeout = timeout
+        self.max_search_limit = max_search_limit
+        self.max_histogram_buckets = max_histogram_buckets
         self.backend = None
         self.server_version = None
         self.last_query_ms = 0
@@ -287,23 +303,23 @@ class OpenSearchClient:
                 "list_index_patterns requires the OpenSearch Dashboards backend. "
                 "Set OPENSEARCH_DASHBOARDS_URL to enable it."
             )
+        # Dashboards 2.x uses saved_objects API; older versions used index_patterns API
         r = self._session.get(
-            f"{self.dashboards_url}/api/index_patterns/index_pattern",
+            f"{self.dashboards_url}/api/saved_objects/_find",
+            params={"type": "index-pattern", "fields": ["title", "timeFieldName"], "per_page": 200},
             verify=self.verify_ssl,
             timeout=self.timeout,
         )
         r.raise_for_status()
         data = r.json()
-        patterns = data.get("index_pattern", [])
-        if not isinstance(patterns, list):
-            patterns = [patterns] if patterns else []
+        saved_objects = data.get("saved_objects", [])
         return [
             {
                 "id": p.get("id"),
                 "title": p.get("attributes", {}).get("title"),
                 "timeFieldName": p.get("attributes", {}).get("timeFieldName"),
             }
-            for p in patterns
+            for p in saved_objects
         ]
 
     def get_mapping(self, index: str) -> dict:
@@ -352,10 +368,11 @@ class OpenSearchClient:
         source_fields: list = None,
     ) -> dict:
         """Search with a Lucene query string. Returns {"total": N, "hits": [...]}."""
+        capped = min(limit, self.max_search_limit)
         q = self._qs_query(query_string, from_ts, to_ts, ts_field)
         body = {
             "query": q,
-            "size": limit,
+            "size": capped,
             "sort": [{(sort_field or ts_field): {"order": sort_dir}}],
         }
         if source_fields:
@@ -365,10 +382,16 @@ class OpenSearchClient:
         total = hits.get("total", {})
         if isinstance(total, dict):
             total = total.get("value", 0)
-        return {
+        out = {
             "total": total,
             "hits": [h.get("_source", {}) for h in hits.get("hits", [])],
         }
+        if capped < limit:
+            out["warning"] = (
+                f"limit capped at {capped} (requested {limit}). "
+                "Use source_fields to reduce response size, or paginate with multiple calls."
+            )
+        return out
 
     def count(
         self,
@@ -432,6 +455,44 @@ class OpenSearchClient:
             out[a["id"]] = {b["key"]: b["doc_count"] for b in buckets}
         return out
 
+    @staticmethod
+    def _parse_ts(ts: str) -> float:
+        """Parse an ISO 8601 UTC timestamp to a Unix epoch float."""
+        ts = ts.rstrip("Z")
+        for fmt in ("%Y-%m-%dT%H:%M:%S.%f", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d"):
+            try:
+                return datetime.strptime(ts, fmt).replace(tzinfo=timezone.utc).timestamp()
+            except ValueError:
+                continue
+        raise ValueError(f"Cannot parse timestamp: {ts!r}")
+
+    def _check_histogram_buckets(self, from_ts: str, to_ts: str, interval: str):
+        """Raise ValueError if the expected bucket count exceeds the safe limit."""
+        if interval == "auto":
+            return  # auto delegates to OpenSearch with a fixed cap of 50
+        m = _INTERVAL_RE.match(interval)
+        if not m:
+            raise ValueError(
+                f"Invalid interval {interval!r}. "
+                "Use a number + unit, e.g. '15m', '1h', '1d'. "
+                "Valid units: s m h d w M y. Or use 'auto'."
+            )
+        interval_secs = int(m.group(1)) * _INTERVAL_SECONDS[m.group(2)]
+        try:
+            t0 = self._parse_ts(from_ts)
+            t1 = self._parse_ts(to_ts)
+        except ValueError as e:
+            raise ValueError(f"Cannot compute bucket count: {e}") from e
+        range_secs = max(t1 - t0, 0)
+        expected = int(range_secs / interval_secs) + 1
+        if expected > self.max_histogram_buckets:
+            raise ValueError(
+                f"Too many buckets: ~{expected:,} expected "
+                f"({from_ts} → {to_ts} at interval {interval}). "
+                f"Limit is {self.max_histogram_buckets:,}. "
+                "Use a coarser interval or a narrower time range."
+            )
+
     def histogram(
         self,
         index: str,
@@ -442,6 +503,7 @@ class OpenSearchClient:
         query_string: str = "*",
     ) -> dict:
         """Temporal histogram. Returns {"results": {timestamp: count}}."""
+        self._check_histogram_buckets(from_ts, to_ts, interval)
         q = self._qs_query(query_string, from_ts, to_ts, ts_field)
         if interval == "auto":
             agg_spec = {"auto_date_histogram": {"field": ts_field, "buckets": 50}}
@@ -558,6 +620,12 @@ def init_client() -> OpenSearchClient:
         else _coerce_bool(config.get("verify_ssl", True))
     )
     timeout = int(os.environ.get("OPENSEARCH_TIMEOUT", config.get("timeout", 60)))
+    max_search_limit = int(
+        os.environ.get("OPENSEARCH_MAX_SEARCH_LIMIT", config.get("max_search_limit", MAX_SEARCH_LIMIT))
+    )
+    max_histogram_buckets = int(
+        os.environ.get("OPENSEARCH_MAX_HISTOGRAM_BUCKETS", config.get("max_histogram_buckets", MAX_HISTOGRAM_BUCKETS))
+    )
 
     client = OpenSearchClient(
         dashboards_url=dashboards_url,
@@ -566,6 +634,8 @@ def init_client() -> OpenSearchClient:
         password=password,
         verify_ssl=verify_ssl,
         timeout=timeout,
+        max_search_limit=max_search_limit,
+        max_histogram_buckets=max_histogram_buckets,
     )
     logger.info(
         "OpenSearch client ready (dashboards=%s, direct=%s)",
