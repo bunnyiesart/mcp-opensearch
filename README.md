@@ -65,12 +65,23 @@ Or run the interactive setup script:
 
 ### 3a. Docker (recommended)
 
+Pull the pre-built image from GHCR:
+
+```bash
+docker pull ghcr.io/bunnyiesart/mcp-opensearch:latest
+```
+
+Or build locally:
+
 ```bash
 make build
+```
 
-# Verify it works:
+Verify it works:
+
+```bash
 echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"0"}}}' | \
-  docker run --rm -i --network host --env-file ~/.config/mcp-opensearch/.env opensearch-mcp:dev
+  docker run --rm -i --network host --env-file ~/.config/mcp-opensearch/.env ghcr.io/bunnyiesart/mcp-opensearch:latest
 ```
 
 ### 3b. Python (no Docker)
@@ -95,7 +106,7 @@ Add the server to `~/.claude.json` under your project path:
           "args": [
             "run", "--rm", "-i", "--network", "host",
             "--env-file", "/home/youruser/.config/mcp-opensearch/.env",
-            "opensearch-mcp:dev"
+            "ghcr.io/bunnyiesart/mcp-opensearch:latest"
           ],
           "env": {}
         }
