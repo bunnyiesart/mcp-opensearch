@@ -1,6 +1,6 @@
 IMAGE      := opensearch-mcp:dev
 GHCR_IMAGE := ghcr.io/bunnyiesart/mcp-opensearch
-VERSION    := 0.3.0
+VERSION    := 0.3.1
 ENV_FILE   := $(HOME)/.config/mcp-opensearch/.env
 
 .PHONY: build run shell push
