@@ -365,24 +365,48 @@ class OpenSearchClient:
                 "list_index_patterns requires the OpenSearch Dashboards backend. "
                 "Set OPENSEARCH_DASHBOARDS_URL to enable it."
             )
-        # Dashboards 2.x uses saved_objects API; older versions used index_patterns API
-        r = self._session.get(
-            f"{self.dashboards_url}/api/saved_objects/_find",
-            params={"type": "index-pattern", "fields": ["title", "timeFieldName"], "per_page": 200},
-            verify=self.verify_ssl,
-            timeout=self.timeout,
+        # Try saved_objects API (Dashboards 2.x), then data_views API (newer versions)
+        for endpoint, params, extractor in [
+            (
+                "/api/saved_objects/_find",
+                {"type": "index-pattern", "fields": ["title", "timeFieldName"], "per_page": 200},
+                lambda data: [
+                    {
+                        "id": p.get("id"),
+                        "title": p.get("attributes", {}).get("title"),
+                        "timeFieldName": p.get("attributes", {}).get("timeFieldName"),
+                    }
+                    for p in data.get("saved_objects", [])
+                ],
+            ),
+            (
+                "/api/data_views",
+                {},
+                lambda data: [
+                    {
+                        "id": p.get("id"),
+                        "title": p.get("title"),
+                        "timeFieldName": p.get("timeFieldName"),
+                    }
+                    for p in data.get("data_view", [])
+                ],
+            ),
+        ]:
+            r = self._session.get(
+                f"{self.dashboards_url}{endpoint}",
+                params=params,
+                verify=self.verify_ssl,
+                timeout=self.timeout,
+            )
+            if r.status_code == 404:
+                continue
+            self._raise_for_status(r, f"GET {endpoint} (index patterns)")
+            return extractor(r.json())
+        raise RuntimeError(
+            "Could not list index patterns — neither /api/saved_objects/_find "
+            "nor /api/data_views returned a valid response. "
+            "Check Dashboards version and user privileges."
         )
-        self._raise_for_status(r, "GET /api/saved_objects/_find (index patterns)")
-        data = r.json()
-        saved_objects = data.get("saved_objects", [])
-        return [
-            {
-                "id": p.get("id"),
-                "title": p.get("attributes", {}).get("title"),
-                "timeFieldName": p.get("attributes", {}).get("timeFieldName"),
-            }
-            for p in saved_objects
-        ]
 
     def get_mapping(self, index: str) -> dict:
         """Flattened field mappings for an index. Returns {index: {field: type}}."""

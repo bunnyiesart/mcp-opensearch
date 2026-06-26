@@ -344,7 +344,7 @@ Fastest way to check how many documents match a condition. Never returns documen
 | `ts_field` | str | `"@timestamp"` | Timestamp field name |
 
 ```json
-{"count": 559359}
+{"result": 559359}
 ```
 
 ---
