@@ -459,10 +459,6 @@ class OpenSearchClient:
         total = hits.get("total", {})
         if isinstance(total, dict):
             total = total.get("value", 0)
-        out = {
-            "total": total,
-            "hits": [h.get("_source", {}) for h in hits.get("hits", [])],
-        }
         warnings = []
         if capped < limit:
             warnings.append(
@@ -471,8 +467,10 @@ class OpenSearchClient:
             )
         if not from_ts and not to_ts:
             warnings.append(_NO_TIME_RANGE_WARNING)
+        out = {"total": total}
         if warnings:
             out["warning"] = " | ".join(warnings)
+        out["hits"] = [h.get("_source", {}) for h in hits.get("hits", [])]
         return out
 
     def count(

@@ -227,7 +227,7 @@ def opensearch_count(
     from_ts: Optional[str] = None,
     to_ts: Optional[str] = None,
     ts_field: str = "@timestamp",
-) -> int:
+) -> dict:
     """Fastest way to check how many documents match a condition; never returns content.
 
     Prefer over opensearch_search when you only need the count — it never fills context
