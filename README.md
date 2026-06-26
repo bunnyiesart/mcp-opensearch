@@ -16,6 +16,9 @@
         \_|_________|_/     ~~
 ```
 
+[![PyPI](https://img.shields.io/pypi/v/mcp-opensearch)](https://pypi.org/project/mcp-opensearch/)
+[![Docker](https://img.shields.io/badge/ghcr.io-mcp--opensearch-blue)](https://ghcr.io/bunnyiesart/mcp-opensearch)
+
 > Read-only MCP server for OpenSearch and OpenSearch Dashboards — search, aggregate, and explore your log data from Claude Code or any MCP-compatible AI assistant.
 
 ## Features
@@ -85,7 +88,15 @@ echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":
   docker run --rm -i --network host --env-file ~/.config/mcp-opensearch/.env ghcr.io/bunnyiesart/mcp-opensearch:latest
 ```
 
-### 3b. Python (no Docker)
+### 3b. PyPI (recommended for Python users)
+
+```bash
+pip install mcp-opensearch
+```
+
+This installs the `mcp-opensearch` command directly into your PATH — no cloning or Docker required.
+
+### 3c. From source
 
 ```bash
 pip install -r requirements.txt
@@ -94,7 +105,32 @@ python3 server.py
 
 ### 4. Register with Claude Code
 
-Add the server to `~/.claude.json` under your project path:
+Add the server to `~/.claude.json` under your project path.
+
+**Via PyPI (`mcp-opensearch` command):**
+
+```json
+{
+  "projects": {
+    "/your/project": {
+      "mcpServers": {
+        "opensearch": {
+          "type": "stdio",
+          "command": "mcp-opensearch",
+          "args": [],
+          "env": {
+            "OPENSEARCH_DASHBOARDS_URL": "https://opensearch.example.com",
+            "OPENSEARCH_USERNAME": "myuser",
+            "OPENSEARCH_PASSWORD": "mypassword"
+          }
+        }
+      }
+    }
+  }
+}
+```
+
+**Via Docker:**
 
 ```json
 {
