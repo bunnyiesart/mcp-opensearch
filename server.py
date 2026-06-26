@@ -701,5 +701,9 @@ Step 5 — Summarize: new threats? increased activity from known sources? agents
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 
-if __name__ == "__main__":
+def main():
     mcp.run()
+
+
+if __name__ == "__main__":
+    main()
