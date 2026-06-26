@@ -22,6 +22,7 @@
 
 - **17 tools** covering connectivity checks, index/field discovery, full-text search, aggregations, time-series histograms, numeric stats, PPL queries, index settings, document explain, comparative analysis, and a generic GET escape hatch
 - **3 investigation prompts** — reusable templates for common log analysis workflows (single-agent investigation, top-offenders sweep, baseline comparison)
+- **Parallel requests** — all tools support concurrent execution; Claude Code can fire multiple queries in a single turn (e.g. `opensearch_count` + `opensearch_terms` + `opensearch_search` simultaneously) for faster investigations
 - Two backends: OpenSearch Dashboards proxy (preferred) or direct OpenSearch REST API
 - Hard limits on search result size (default 200) and histogram bucket count (default 2,000) to protect cluster health
 - Text field aggregation warnings (fielddata heap pressure)
