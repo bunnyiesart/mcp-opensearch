@@ -47,6 +47,7 @@ _ALLOWED_PATHS = {
         "/_cat/indices",
         "/_cluster/health",
         "/_mapping",
+        "/_settings",
         "/api/status",
         "/api/saved_objects/_find",
     ],
@@ -54,6 +55,7 @@ _ALLOWED_PATHS = {
         "/_search",
         "/_count",
         "/_msearch",
+        "/_plugins/_ppl",
         "/api/console/proxy",   # Dashboards proxy (carries the real path)
     ],
 }
@@ -675,6 +677,64 @@ class OpenSearchClient:
             "sum": st.get("sum", 0),
             "std_deviation": st.get("std_deviation", 0),
         }
+
+    # ── Bypass methods (caller owns path validation) ──────────
+
+    def raw_get(self, path: str, params: dict = None) -> dict:
+        """GET any path, bypassing the read-only allowlist. Caller owns validation."""
+        self._resolve_backend()
+        if self.backend == BACKEND_DASHBOARDS:
+            return self._dashboards_proxy("GET", path, params=params)
+        r = self._session.get(
+            f"{self.opensearch_url}{path}",
+            params=params,
+            verify=self.verify_ssl,
+            timeout=self.timeout,
+        )
+        self._raise_for_status(r, f"GET {path}")
+        self.last_query_ms = int(r.elapsed.total_seconds() * 1000)
+        return r.json()
+
+    def raw_post(self, path: str, body: dict = None, params: dict = None) -> dict:
+        """POST any path, bypassing the read-only allowlist. Caller owns validation."""
+        self._resolve_backend()
+        if self.backend == BACKEND_DASHBOARDS:
+            return self._dashboards_proxy("POST", path, body=body, params=params)
+        r = self._session.post(
+            f"{self.opensearch_url}{path}",
+            json=body,
+            params=params,
+            verify=self.verify_ssl,
+            timeout=self.timeout,
+        )
+        self._raise_for_status(r, f"POST {path}")
+        self.last_query_ms = int(r.elapsed.total_seconds() * 1000)
+        return r.json()
+
+    def ppl(self, query: str) -> dict:
+        """Execute a PPL (Piped Processing Language) query."""
+        if not query or not query.strip():
+            raise ValueError("PPL query must not be empty.")
+        return self._post("/_plugins/_ppl", body={"query": query})
+
+    def index_settings(self, index: str) -> dict:
+        """Fetch index settings. Returns a simplified summary per index."""
+        raw = self._get(f"/{index}/_settings")
+        out = {}
+        for idx_name, cfg in raw.items():
+            s = cfg.get("settings", {}).get("index", {})
+            out[idx_name] = {
+                "number_of_shards": s.get("number_of_shards"),
+                "number_of_replicas": s.get("number_of_replicas"),
+                "refresh_interval": s.get("refresh_interval", "1s"),
+                "lifecycle_name": s.get("lifecycle", {}).get("name"),
+                "creation_date_ms": s.get("creation_date"),
+            }
+        return out
+
+    def explain(self, index: str, doc_id: str, query: dict) -> dict:
+        """Explain why a document matches or doesn't match a query."""
+        return self.raw_post(f"/{index}/_explain/{doc_id}", body={"query": query})
 
 
 # ── Config loading ────────────────────────────────────────────────────────────

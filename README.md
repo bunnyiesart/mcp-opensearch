@@ -20,7 +20,8 @@
 
 ## Features
 
-- 12 tools covering connectivity checks, index/field discovery, full-text search, aggregations, time-series histograms, and numeric stats
+- **17 tools** covering connectivity checks, index/field discovery, full-text search, aggregations, time-series histograms, numeric stats, PPL queries, index settings, document explain, comparative analysis, and a generic GET escape hatch
+- **3 investigation prompts** — reusable templates for common log analysis workflows (single-agent investigation, top-offenders sweep, baseline comparison)
 - Two backends: OpenSearch Dashboards proxy (preferred) or direct OpenSearch REST API
 - Hard limits on search result size (default 200) and histogram bucket count (default 2,000) to protect cluster health
 - Text field aggregation warnings (fielddata heap pressure)
@@ -127,7 +128,7 @@ Environment variables take priority over the config file. At least one of `OPENS
 
 #### `opensearch_test`
 
-Test connectivity and confirm the active backend.
+Call first in every session to confirm connectivity and see the active backend. The `username` field immediately explains why certain tools return 403 — it shows exactly which role is authenticated.
 
 No parameters.
 
@@ -141,19 +142,17 @@ No parameters.
 }
 ```
 
-Start every session with this tool. The `username` field immediately explains why certain tools return 403.
-
 ---
-
-### Index Discovery
 
 #### `opensearch_cluster_health` ⚠️
 
-> Requires `cluster:monitor/health` privilege. Returns a permission error if the user lacks it — use `opensearch_test` for basic connectivity instead.
+> Requires `cluster:monitor/health` privilege. If you get 403, use `opensearch_test` for basic connectivity instead.
 
 No parameters. Returns cluster status (`green`/`yellow`/`red`), node count, and active/unassigned shard counts.
 
 ---
+
+### Index Discovery
 
 #### `opensearch_list_indices` ⚠️
 
@@ -171,7 +170,7 @@ No parameters. Returns a list sorted by index name:
 
 #### `opensearch_list_index_patterns`
 
-List saved index patterns from OpenSearch Dashboards. Requires the Dashboards backend.
+Dashboards-only alternative to `opensearch_list_indices` when `_cat/indices` access is blocked. Returns saved index patterns as configured in the Dashboards UI.
 
 No parameters.
 
@@ -185,7 +184,7 @@ No parameters.
 
 #### `opensearch_get_mapping` ⚠️
 
-> Requires `indices:admin/mappings/get` privilege. If you get 403, use `opensearch_discover_fields` instead.
+> Requires `indices:admin/mappings/get` privilege. If you get 403, use `opensearch_discover_fields` instead (only requires search privilege).
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
@@ -207,7 +206,7 @@ Returns all fields flattened to dot-notation:
 
 #### `opensearch_discover_fields`
 
-Discover fields by sampling live documents. Works without mapping privileges.
+Fallback for `opensearch_get_mapping` when the mapping API is blocked. Samples live documents instead of reading schema metadata — only returns fields present in the sampled documents.
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
@@ -218,17 +217,38 @@ Discover fields by sampling live documents. Works without mapping privileges.
 | `ts_field` | str | `"@timestamp"` | Timestamp field name |
 | `sample_size` | int | `10` | Documents to sample (max 100) |
 
-Returns only fields present in the sampled documents, flattened to dot-notation:
-
 ```json
 {
   "agent.id": "str",
   "agent.name": "str",
   "rule.level": "int",
-  "rule.description": "str",
   "@timestamp": "str"
 }
 ```
+
+---
+
+#### `opensearch_index_settings`
+
+Get index operational settings: shard count, replicas, refresh interval, and ILM policy. Use when diagnosing unexpected index behaviour — slow writes, data retention issues, or replication risk. Prefer `opensearch_get_mapping` for field schema exploration.
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `index` | str | — | Index name or wildcard, e.g. `"wazuh-alerts-*"` |
+
+```json
+{
+  "wazuh-alerts-4.x-2026.06.24": {
+    "number_of_shards": "3",
+    "number_of_replicas": "1",
+    "refresh_interval": "1s",
+    "lifecycle_name": "wazuh-alerts-policy",
+    "creation_date_ms": "1750550400000"
+  }
+}
+```
+
+> May require `indices:monitor/settings/get` privilege. Returns 403 if blocked.
 
 ---
 
@@ -236,20 +256,20 @@ Returns only fields present in the sampled documents, flattened to dot-notation:
 
 #### `opensearch_search`
 
-Full-text search using Lucene query syntax — the same syntax as the OpenSearch Dashboards search bar.
+Full-document retrieval using Lucene syntax — the same syntax as the OpenSearch Dashboards search bar. Always pass `source_fields` to limit response size (50 full docs ≈ 237 KB). Omitting `from_ts`/`to_ts` scans the full index history; adding a time range reduces query time by up to 15×.
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `index` | str | — | Index name or wildcard |
+| `index` | str | — | Index name or wildcard pattern |
+| `source_fields` | list | — | **Strongly recommended.** Fields to include, e.g. `["agent.name", "rule.level", "@timestamp"]` |
 | `query_string` | str | `"*"` | Lucene query, e.g. `"rule.level:[12 TO *] AND agent.name:WIN-DC01"` |
 | `from_ts` | str | — | ISO 8601 UTC start time |
 | `to_ts` | str | — | ISO 8601 UTC end time |
 | `ts_field` | str | `"@timestamp"` | Timestamp field name |
 | `limit` | int | `50` | Max documents to return (hard cap: 200) |
-| `offset` | int | `0` | Pagination offset — skip this many documents before returning results |
+| `offset` | int | `0` | Pagination offset — increment by `limit` to page through results |
 | `sort_field` | str | `ts_field` | Field to sort by |
 | `sort_dir` | str | `"desc"` | `"desc"` = newest first, `"asc"` = oldest first |
-| `source_fields` | list | — | Fields to include, e.g. `["agent.name", "rule.level"]`. Strongly recommended — reduces response size by up to 44×. |
 
 ```json
 {
@@ -259,13 +279,13 @@ Full-text search using Lucene query syntax — the same syntax as the OpenSearch
 }
 ```
 
-`warning` is present when the `limit` was capped or no time range was given. To paginate, increment `offset` by `limit` on each call.
+`warning` is present when the `limit` was capped or no time range was given.
 
 ---
 
 #### `opensearch_count`
 
-Count matching documents without fetching them. Much faster than `opensearch_search` when you only need the number.
+Fastest way to check how many documents match a condition. Never returns document content, so it never fills context. Without `from_ts`/`to_ts`, scans the full index (can take 4–5 s on 50 M docs).
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
@@ -276,8 +296,69 @@ Count matching documents without fetching them. Much faster than `opensearch_sea
 | `ts_field` | str | `"@timestamp"` | Timestamp field name |
 
 ```json
-{"count": 559359, "warning": "No time range specified..."}
+{"count": 559359}
 ```
+
+---
+
+#### `opensearch_ppl`
+
+Execute a PPL (Piped Processing Language) query. Prefer over `opensearch_search` when you need multi-step pipeline operations (filter → stats → sort) in a single query. PPL is not interchangeable with Lucene — it uses a different syntax native to OpenSearch observability workloads.
+
+> Returns 404 if the PPL plugin is not installed on the cluster.
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `query` | str | — | Full PPL query string |
+
+**PPL syntax:** `source=<index> | <command> [| <command> ...]`
+
+Common commands:
+
+| Command | Description |
+|---|---|
+| `where <condition>` | Filter rows |
+| `stats count() by <field>` | Aggregate |
+| `fields <f1>, <f2>` | Select columns |
+| `sort -<field>` | Order results (- = descending) |
+| `head <n>` | Limit rows |
+
+```
+source=wazuh-alerts-4.x-* | where rule.level > 10
+| stats count() as hits by agent.name | sort -hits | head 20
+```
+
+```json
+{
+  "schema": [{"name": "agent.name", "type": "keyword"}, {"name": "hits", "type": "integer"}],
+  "datarows": [["WIN-DC01", 4821], ["srv-web01", 2103]]
+}
+```
+
+---
+
+#### `opensearch_explain`
+
+Explain why a specific document matches (or doesn't match) a query. Use after `opensearch_search` returns unexpected results and you have a known document ID. Requires an exact index name — no wildcards.
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `index` | str | — | Exact index name, e.g. `"wazuh-alerts-4.x-2026.06.24"` |
+| `doc_id` | str | — | Document `_id` from a prior search |
+| `query_string` | str | `"*"` | Lucene query to evaluate against the document |
+
+```json
+{
+  "matched": true,
+  "explanation": {
+    "value": 1.0,
+    "description": "ConstantScore(agent.name:WIN-DC01)",
+    "details": []
+  }
+}
+```
+
+> Requires `indices:data/read/explain` privilege.
 
 ---
 
@@ -285,12 +366,12 @@ Count matching documents without fetching them. Much faster than `opensearch_sea
 
 #### `opensearch_terms`
 
-Top N unique values of a field with their document counts (frequency analysis).
+Frequency table for a keyword field — top N values with their document counts. If results look wrong or you see a heap warning, append `.keyword` to the field name (e.g. `agent.name.keyword`). Never use on analyzed text fields like `rule.description` — it loads fielddata into cluster heap.
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
 | `index` | str | — | Index name or wildcard |
-| `field` | str | — | Field to aggregate. Must be a keyword field — for text fields, try appending `.keyword`. |
+| `field` | str | — | Keyword field to aggregate, e.g. `"agent.name"`, `"rule.id"` |
 | `query_string` | str | `"*"` | Lucene filter |
 | `from_ts` | str | — | ISO 8601 UTC start time |
 | `to_ts` | str | — | ISO 8601 UTC end time |
@@ -301,18 +382,17 @@ Top N unique values of a field with their document counts (frequency analysis).
 {
   "WIN-DC01": 4821,
   "srv-web01": 2103,
-  "db-primary": 987,
   "_warning": "Field 'rule.description' looks like a text field. Try 'rule.description.keyword'..."
 }
 ```
 
-`_warning` is present if the field name suggests an analyzed text type (fielddata heap pressure risk).
+`_warning` is present if the field name suggests an analyzed text type.
 
 ---
 
 #### `opensearch_multi_terms`
 
-Run multiple field frequency analyses in a single API call. Significantly faster than multiple `opensearch_terms` calls.
+Preferred over calling `opensearch_terms` in a loop — runs multiple field frequency analyses in a single round-trip. Significantly faster when you need counts for several fields at once.
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
@@ -329,18 +409,6 @@ Each item in `aggregations`:
 {"id": "agents", "field": "agent.name", "size": 20}
 ```
 
-Example call:
-
-```json
-{
-  "aggregations": [
-    {"id": "agents",  "field": "agent.name", "size": 20},
-    {"id": "rules",   "field": "rule.id",    "size": 10},
-    {"id": "sources", "field": "data.srcip", "size": 30}
-  ]
-}
-```
-
 ```json
 {
   "agents":  {"WIN-DC01": 4821, "srv-web01": 2103},
@@ -353,7 +421,7 @@ Example call:
 
 #### `opensearch_histogram`
 
-Event count histogram over a time range.
+Event count over time. Always specify `from_ts` and `to_ts` (meaningless without a range). Use `interval="auto"` when unsure — it picks ~50 buckets and is always safe. Fine intervals over long ranges (e.g. `"1m"` over a week) are rejected before the query runs.
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
@@ -361,29 +429,26 @@ Event count histogram over a time range.
 | `from_ts` | str | — | **Required.** ISO 8601 UTC start time |
 | `to_ts` | str | — | **Required.** ISO 8601 UTC end time |
 | `ts_field` | str | `"@timestamp"` | Timestamp field name |
-| `interval` | str | `"1h"` | Bucket size. Format: `<number><unit>` where unit is one of `s m h d w M y`. Use `"auto"` to let OpenSearch choose (~50 buckets). |
+| `interval` | str | `"1h"` | Bucket size. Format: `<number><unit>` where unit is `s m h d w M y`. Use `"auto"` for ~50 buckets. |
 | `query_string` | str | `"*"` | Lucene filter |
-
-Requests that would produce more than 2,000 buckets are rejected before the query runs. A 1-minute interval over a 1-year range produces ~525,000 buckets and would cause a server-side timeout — the pre-check catches this instantly.
 
 ```json
 {
   "interval_used": "1h",
   "results": {
     "2026-06-24T00:00:00.000Z": 1203,
-    "2026-06-24T01:00:00.000Z": 987,
-    "2026-06-24T02:00:00.000Z": 1541
+    "2026-06-24T01:00:00.000Z": 987
   }
 }
 ```
 
-`interval_used` reflects the actual bucket size chosen by OpenSearch when `interval="auto"`.
+`interval_used` reflects the actual bucket size chosen when `interval="auto"`.
 
 ---
 
 #### `opensearch_stats`
 
-Numeric statistics for a field.
+Min/max/avg/std for a numeric field. Only works on numeric types (integer, float, long) — passing a text field returns a 400 error with a clear message.
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
@@ -405,7 +470,103 @@ Numeric statistics for a field.
 }
 ```
 
-Returns a clear error if a non-numeric field is passed.
+---
+
+#### `opensearch_compare`
+
+Compare the top values of a field between two time windows. Returns a structured diff with added, removed, and changed values sorted by absolute delta. Prefer over calling `opensearch_terms` twice manually.
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `index` | str | — | Index name or wildcard |
+| `field` | str | — | Keyword field, e.g. `"rule.id"`, `"agent.name"` |
+| `baseline_from` | str | — | Baseline window start, ISO 8601 UTC |
+| `baseline_to` | str | — | Baseline window end, ISO 8601 UTC |
+| `selection_from` | str | — | Selection window start, ISO 8601 UTC |
+| `selection_to` | str | — | Selection window end, ISO 8601 UTC |
+| `query_string` | str | `"*"` | Lucene filter applied to both windows |
+| `ts_field` | str | `"@timestamp"` | Timestamp field name |
+| `size` | int | `20` | Top N values to fetch per window |
+
+```json
+{
+  "added":     {"new-host-01": 342},
+  "removed":   {"decommissioned-srv": 12},
+  "changed":   {
+    "WIN-DC01": {"baseline": 1200, "selection": 4821, "delta": 3621, "pct_change": 301.8}
+  },
+  "unchanged": {"srv-web01": {"baseline": 2100, "selection": 2103}},
+  "baseline_warning": null,
+  "selection_warning": null
+}
+```
+
+`changed` is sorted by absolute delta descending so the most significant shifts appear first.
+
+---
+
+### Escape Hatch
+
+#### `opensearch_api`
+
+Generic GET escape hatch for any read endpoint not covered by the other tools. Use when you know the OpenSearch REST path but no dedicated tool exists. For search, aggregations, and histograms, use the dedicated tools — they add safety guards and better error messages.
+
+Write and admin paths are blocked: any path containing `_delete`, `_bulk`, `_update`, `_create`, `_reindex`, `_rollover`, `_shrink`, `_split`, `_clone`, `_open`, `_freeze`, `_unfreeze`, or `_forcemerge` raises an error before any request is made.
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `path` | str | — | OpenSearch path starting with `"/"`, e.g. `"/_nodes/stats"` |
+
+Example valid paths:
+- `/_nodes/stats`
+- `/_plugins/_ism/policies`
+- `/my-index/_alias`
+- `/my-index/_shard_stores`
+
+Returns the raw JSON response from OpenSearch.
+
+---
+
+## Prompts
+
+MCP Prompts are reusable investigation templates. In compatible clients they appear as slash commands. Each prompt returns a step-by-step workflow pre-filled with the parameters you provide.
+
+### `investigate_alert`
+
+Step-by-step investigation guide for a specific agent's alerts in a time window. Walks through: total count → rule distribution → rule descriptions → event timeline → highest-severity sample → summary questions.
+
+| Parameter | Description |
+|---|---|
+| `index` | Index name or wildcard, e.g. `"wazuh-alerts-4.x-*"` |
+| `agent_name` | Agent to investigate, e.g. `"WIN-DC01"` |
+| `from_ts` | Window start, ISO 8601 UTC |
+| `to_ts` | Window end, ISO 8601 UTC |
+
+---
+
+### `top_offenders`
+
+Find the top agents, rules, and source/destination IPs in a time window. Runs five independent aggregations in parallel, then guides you through correlating spikes, pivot points, and anomalous counts.
+
+| Parameter | Description |
+|---|---|
+| `index` | Index name or wildcard |
+| `from_ts` | Window start, ISO 8601 UTC |
+| `to_ts` | Window end, ISO 8601 UTC |
+
+---
+
+### `compare_time_windows`
+
+Compare alert patterns between a baseline period and a selection period. Uses `opensearch_compare` across rule IDs, agent names, and source IPs, then guides you through drilling into new threats, increased activity, and agents that went quiet.
+
+| Parameter | Description |
+|---|---|
+| `index` | Index name or wildcard |
+| `baseline_from` | Baseline start, ISO 8601 UTC |
+| `baseline_to` | Baseline end, ISO 8601 UTC |
+| `selection_from` | Selection start, ISO 8601 UTC |
+| `selection_to` | Selection end, ISO 8601 UTC |
 
 ---
 
@@ -417,6 +578,7 @@ Returns a clear error if a non-numeric field is passed.
 | Max histogram buckets | 2,000 | `OPENSEARCH_MAX_HISTOGRAM_BUCKETS` |
 | Max `discover_fields` sample size | 100 docs | hardcoded |
 | Write guard | all writes blocked | hardcoded |
+| `opensearch_api` write fragments | blocked | hardcoded |
 
 **Bucket pre-check** — Histogram requests are validated before execution. The expected bucket count is calculated as `(to_ts − from_ts) / interval`. If it exceeds the limit, the request is rejected with an actionable error message instead of firing a query that would hold OpenSearch threads for minutes.
 
@@ -424,15 +586,19 @@ Returns a clear error if a non-numeric field is passed.
 
 **No-time-range warnings** — `opensearch_search` and `opensearch_count` include a `warning` when no `from_ts`/`to_ts` is given. A full-index scan on tens of millions of documents is slow and expensive; adding a time range typically reduces query time by 10–15×.
 
+**Write-fragment blocklist** — `opensearch_api` checks the path for 14 keywords that indicate write or admin operations before making any request.
+
 ## Known Limitations
 
-Three tools require elevated privileges not available on all deployments:
+Four tools require elevated privileges not available on all deployments:
 
 | Tool | Required privilege | Alternative |
 |---|---|---|
 | `opensearch_cluster_health` | `cluster:monitor/health` | `opensearch_test` (basic connectivity) |
 | `opensearch_list_indices` | `_cat/indices` via proxy | `opensearch_list_index_patterns` |
 | `opensearch_get_mapping` | `indices:admin/mappings/get` | `opensearch_discover_fields` |
+| `opensearch_index_settings` | `indices:monitor/settings/get` | — |
+| `opensearch_ppl` | PPL plugin must be installed | `opensearch_search` (Lucene) |
 
 These tools return a structured error message (not a raw stack trace) when the privilege is missing. The `opensearch_test` tool includes the authenticated `username` in its response, which immediately clarifies why specific calls fail.
 
