@@ -148,7 +148,12 @@ class OpenSearchClient:
 
         Uses suffix-match so /wazuh-alerts-*/_search passes "/_search".
         """
-        clean = posixpath.normpath(path.split("?")[0])
+        raw = path.split("?")[0]
+        clean = posixpath.normpath(raw)
+        if clean != raw:
+            raise PermissionError(
+                f"Blocked {method} {path} — path traversal detected."
+            )
         allowed = _ALLOWED_PATHS.get(method, [])
         if not any(clean == p or clean.endswith(p) for p in allowed):
             raise PermissionError(
