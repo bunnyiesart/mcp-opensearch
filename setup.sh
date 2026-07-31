@@ -4,6 +4,14 @@
 
 set -e
 
+# Require Python 3.10+
+PY_MINOR=$(python3 -c "import sys; print(sys.version_info.minor)" 2>/dev/null || echo "0")
+PY_MAJOR=$(python3 -c "import sys; print(sys.version_info.major)" 2>/dev/null || echo "0")
+if [ "$PY_MAJOR" -lt 3 ] || { [ "$PY_MAJOR" -eq 3 ] && [ "$PY_MINOR" -lt 10 ]; }; then
+    echo "Error: Python 3.10 or higher is required (found $(python3 --version 2>&1))" >&2
+    exit 1
+fi
+
 CONFIG_DIR="$HOME/.config/mcp-opensearch"
 CONFIG_FILE="$CONFIG_DIR/config.json"
 

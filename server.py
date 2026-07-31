@@ -405,7 +405,6 @@ def opensearch_stats(
     )
 
 
-# ── New tools ─────────────────────────────────────────────────────────────────
 
 @mcp.tool()
 def opensearch_ppl(query: str) -> dict:

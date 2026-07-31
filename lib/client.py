@@ -15,6 +15,7 @@ import posixpath
 import re
 import stat
 from datetime import datetime, timezone
+from urllib.parse import urlencode
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -128,7 +129,7 @@ class OpenSearchClient:
             "Accept": "application/json",
             "Content-Type": "application/json",
             "osd-xsrf": "true",
-            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+            "User-Agent": "mcp-opensearch/0.3.3",
         })
 
         retry = Retry(
@@ -280,8 +281,7 @@ class OpenSearchClient:
         """Route an OpenSearch request through Dashboards /api/console/proxy."""
         os_path = path.lstrip("/")
         if params:
-            qs = "&".join(f"{k}={v}" for k, v in params.items())
-            os_path = f"{os_path}?{qs}"
+            os_path = f"{os_path}?{urlencode(params)}"
 
         r = self._session.post(
             f"{self.dashboards_url}/api/console/proxy",
