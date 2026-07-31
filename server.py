@@ -446,6 +446,7 @@ def opensearch_api(path: str) -> dict:
 
     Examples of valid paths:
         /_nodes/stats
+        /_cat/plugins?format=json
         /_plugins/_ism/policies
         /my-index/_alias
         /my-index/_shard_stores
@@ -454,7 +455,8 @@ def opensearch_api(path: str) -> dict:
         path: OpenSearch path starting with "/", e.g. "/_nodes/stats".
 
     Returns:
-        Raw JSON response from OpenSearch.
+        Raw JSON response from OpenSearch. Endpoints that return a JSON array
+        (e.g. the _cat/* APIs) are wrapped as {"result": [...]}.
     """
     if not path.startswith("/"):
         raise ValueError(f"path must start with '/'. Got: {path!r}")
@@ -464,7 +466,12 @@ def opensearch_api(path: str) -> dict:
             f"Path {path!r} contains restricted keyword(s) {hits} — "
             "only read endpoints are permitted."
         )
-    return get_client().raw_get(path)
+    result = get_client().raw_get(path)
+    # FastMCP requires structured output to be a dict; wrap array responses
+    # (e.g. /_cat/* endpoints) so they don't fail serialization.
+    if not isinstance(result, dict):
+        return {"result": result}
+    return result
 
 
 @mcp.tool()
