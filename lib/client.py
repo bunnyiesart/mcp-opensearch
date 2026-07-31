@@ -51,12 +51,14 @@ _ALLOWED_PATHS = {
         "/_settings",
         "/api/status",
         "/api/saved_objects/_find",
+        "/_plugins/_alerting/monitors/alerts",  # Alerting plugin: active alerts (read)
     ],
     "POST": [
         "/_search",
         "/_count",
         "/_msearch",
         "/_plugins/_ppl",
+        "/_plugins/_alerting/monitors/_search",  # Alerting plugin: search monitors (read)
         "/api/console/proxy",   # Dashboards proxy (carries the real path)
     ],
 }
@@ -129,7 +131,7 @@ class OpenSearchClient:
             "Accept": "application/json",
             "Content-Type": "application/json",
             "osd-xsrf": "true",
-            "User-Agent": "mcp-opensearch/0.3.3",
+            "User-Agent": "mcp-opensearch/0.4.0",
         })
 
         retry = Retry(
@@ -502,6 +504,51 @@ class OpenSearchClient:
         out["hits"] = [h.get("_source", {}) for h in hits.get("hits", [])]
         return out
 
+    def timeline(
+        self,
+        index: str,
+        entity: str,
+        fields: list,
+        from_ts: str = None,
+        to_ts: str = None,
+        ts_field: str = "@timestamp",
+        limit: int = 100,
+        source_fields: list = None,
+        extra_query: str = None,
+    ) -> dict:
+        """Chronological event timeline for one entity across multiple fields.
+
+        Matches `entity` against any of `fields` (OR) and returns hits oldest-first.
+        Returns {"total": N, "entity": str, "fields": [...], "events": [...]}.
+        """
+        if not fields:
+            raise ValueError("fields must be a non-empty list of field names to match the entity against.")
+        escaped = str(entity).replace('"', '\\"')
+        clauses = " OR ".join(f'{f}:"{escaped}"' for f in fields)
+        qs = f"({clauses})"
+        if extra_query:
+            qs = f"{qs} AND ({extra_query})"
+        result = self.search_string(
+            index,
+            query_string=qs,
+            from_ts=from_ts,
+            to_ts=to_ts,
+            ts_field=ts_field,
+            limit=limit,
+            sort_field=ts_field,
+            sort_dir="asc",
+            source_fields=source_fields,
+        )
+        out = {
+            "total": result.get("total", 0),
+            "entity": entity,
+            "fields": fields,
+            "events": result.get("hits", []),
+        }
+        if "warning" in result:
+            out["warning"] = result["warning"]
+        return out
+
     def count(
         self,
         index: str,
@@ -762,6 +809,61 @@ class OpenSearchClient:
     def explain(self, index: str, doc_id: str, query: dict) -> dict:
         """Explain why a document matches or doesn't match a query."""
         return self.raw_post(f"/{index}/_explain/{doc_id}", body={"query": query})
+
+    # ── Alerting plugin (read-only) ───────────────────────────
+
+    def list_monitors(self, size: int = 50) -> list:
+        """List configured Alerting-plugin monitors. Returns a summary per monitor.
+
+        Requires the OpenSearch Alerting plugin and cluster:admin/opendistro/
+        alerting/monitor/search privilege. Returns 403/404 if unavailable.
+        """
+        body = {"size": size, "query": {"match_all": {}}}
+        result = self._post("/_plugins/_alerting/monitors/_search", body=body)
+        out = []
+        for hit in result.get("hits", {}).get("hits", []):
+            mon = hit.get("_source", {}).get("monitor", hit.get("_source", {}))
+            out.append({
+                "id": hit.get("_id"),
+                "name": mon.get("name"),
+                "enabled": mon.get("enabled"),
+                "type": mon.get("monitor_type"),
+                "schedule": mon.get("schedule"),
+            })
+        return out
+
+    def get_alerts(
+        self,
+        state: str = None,
+        monitor_id: str = None,
+        size: int = 50,
+    ) -> dict:
+        """Fetch alerts raised by Alerting-plugin monitors.
+
+        state: filter by alert state, e.g. "ACTIVE", "ACKNOWLEDGED", "COMPLETED".
+        monitor_id: restrict to a single monitor.
+        Requires the Alerting plugin. Returns 403/404 if unavailable.
+        """
+        params = {"size": size, "sortField": "start_time", "sortOrder": "desc"}
+        if state:
+            params["alertState"] = state
+        if monitor_id:
+            params["monitorId"] = monitor_id
+        result = self._get("/_plugins/_alerting/monitors/alerts", params=params)
+        alerts = [
+            {
+                "id": a.get("alert_id") or a.get("id"),
+                "monitor_name": a.get("monitor_name"),
+                "trigger_name": a.get("trigger_name"),
+                "state": a.get("state"),
+                "severity": a.get("severity"),
+                "start_time": a.get("start_time"),
+                "last_notification_time": a.get("last_notification_time"),
+                "acknowledged_time": a.get("acknowledged_time"),
+            }
+            for a in result.get("alerts", [])
+        ]
+        return {"total": result.get("totalAlerts", len(alerts)), "alerts": alerts}
 
 
 # ── Config loading ────────────────────────────────────────────────────────────

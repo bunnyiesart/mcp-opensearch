@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.4.0] - 2026-07-31
+
+### Added
+- `opensearch_get_alerts` — fetch alerts raised by the OpenSearch Alerting plugin, filterable by state (ACTIVE/ACKNOWLEDGED/…) and monitor. Answers "what is firing right now?"
+- `opensearch_list_monitors` — list configured Alerting-plugin monitors (detection rules) and their enabled state.
+- `opensearch_timeline` — chronological event timeline for a single entity (IP, host, user) matched across multiple fields at once. The core DFIR pivot, previously requiring several manual `opensearch_search` calls.
+- `triage_alerts` prompt — SOC flow that pulls active alerts, maps them to monitors, then pivots on the top offending entity's timeline.
+- Read-only allowlist extended with the two Alerting-plugin read endpoints (`/_plugins/_alerting/monitors/_search`, `/_plugins/_alerting/monitors/alerts`). No write paths added — the read-only guarantee is unchanged.
+
 ## [0.3.3] - 2026-07-31
 
 ### Fixed
