@@ -21,6 +21,8 @@ Exposes:
   opensearch_index_settings      — shard count, replicas, ILM policy, refresh interval
   opensearch_list_monitors       — list Alerting-plugin monitors (detection rules)
   opensearch_get_alerts          — fetch alerts raised by Alerting-plugin monitors
+  opensearch_list_detectors      — list Anomaly Detection detectors
+  opensearch_get_anomaly_results — fetch detected anomalies, most anomalous first
   opensearch_compare             — diff top field values across two time windows
 
 Prompts:
@@ -499,6 +501,7 @@ def opensearch_api(path: str) -> dict:
 
     Examples of valid paths:
         /_nodes/stats
+        /_cat/plugins?format=json
         /_plugins/_ism/policies
         /my-index/_alias
         /my-index/_shard_stores
@@ -507,7 +510,8 @@ def opensearch_api(path: str) -> dict:
         path: OpenSearch path starting with "/", e.g. "/_nodes/stats".
 
     Returns:
-        Raw JSON response from OpenSearch.
+        Raw JSON response from OpenSearch. Endpoints that return a JSON array
+        (e.g. the _cat/* APIs) are wrapped as {"result": [...]}.
     """
     if not path.startswith("/"):
         raise ValueError(f"path must start with '/'. Got: {path!r}")
@@ -517,7 +521,12 @@ def opensearch_api(path: str) -> dict:
             f"Path {path!r} contains restricted keyword(s) {hits} — "
             "only read endpoints are permitted."
         )
-    return get_client().raw_get(path)
+    result = get_client().raw_get(path)
+    # FastMCP requires structured output to be a dict; wrap array responses
+    # (e.g. /_cat/* endpoints) so they don't fail serialization.
+    if not isinstance(result, dict):
+        return {"result": result}
+    return result
 
 
 @mcp.tool()
@@ -612,6 +621,60 @@ def opensearch_get_alerts(
                                  "severity", "start_time", ...}, ...]}
     """
     return get_client().get_alerts(state=state, monitor_id=monitor_id, size=size)
+
+
+# ── Anomaly Detection (read-only) ────────────────────────────────────────────────
+
+@mcp.tool()
+def opensearch_list_detectors(size: int = 50) -> list:
+    """List OpenSearch Anomaly Detection detectors and the indices they watch.
+
+    Use to see what anomaly detectors exist before pulling their results with
+    opensearch_get_anomaly_results. Requires the Anomaly Detection plugin and
+    detector-search privilege; returns 403/404 otherwise.
+
+    Args:
+        size: Max detectors to return (default 50).
+
+    Returns:
+        [{"id", "name", "description", "indices", "detection_interval"}, ...]
+    """
+    return get_client().list_detectors(size=size)
+
+
+@mcp.tool()
+def opensearch_get_anomaly_results(
+    detector_id: Optional[str] = None,
+    from_ts: Optional[str] = None,
+    to_ts: Optional[str] = None,
+    min_grade: float = 0.0,
+    size: int = 50,
+) -> dict:
+    """Fetch detected anomalies (beaconing, spikes, rare activity), most anomalous first.
+
+    Surfaces ML-detected anomalies without hand-writing aggregations. Get detector IDs
+    from opensearch_list_detectors. Requires the Anomaly Detection plugin; returns
+    403/404 otherwise.
+
+    Args:
+        detector_id: Restrict to one detector (recommended).
+        from_ts: Start time filter on data_end_time, UTC ISO 8601.
+        to_ts: End time filter on data_end_time, UTC ISO 8601.
+        min_grade: Only return anomalies with anomaly_grade >= this (0-1). Default 0
+                   returns all real anomalies (grade > 0). Raise to ~0.7 for high-confidence.
+        size: Max anomalies to return, highest grade first (default 50).
+
+    Returns:
+        {"total": N, "anomalies": [{"detector_id", "anomaly_grade", "confidence",
+                                    "data_start_time", "data_end_time"}, ...]}
+    """
+    return get_client().get_anomaly_results(
+        detector_id=detector_id,
+        from_ts=from_ts,
+        to_ts=to_ts,
+        min_grade=min_grade,
+        size=size,
+    )
 
 
 @mcp.tool()

@@ -23,7 +23,7 @@
 
 ## Features
 
-- **20 tools** covering connectivity checks, index/field discovery, full-text search, entity timelines, aggregations, time-series histograms, numeric stats, PPL queries, index settings, document explain, comparative analysis, Alerting-plugin monitors and alerts, and a generic GET escape hatch
+- **22 tools** covering connectivity checks, index/field discovery, full-text search, entity timelines, aggregations, time-series histograms, numeric stats, PPL queries, index settings, document explain, comparative analysis, Alerting-plugin monitors and alerts, Anomaly Detection detectors and results, and a generic GET escape hatch
 - **4 investigation prompts** — reusable templates for common log analysis workflows (single-agent investigation, top-offenders sweep, alert triage, baseline comparison)
 - **Parallel requests** — all tools support concurrent execution; Claude Code can fire multiple queries in a single turn (e.g. `opensearch_count` + `opensearch_terms` + `opensearch_search` simultaneously) for faster investigations
 - Two backends: OpenSearch Dashboards proxy (preferred) or direct OpenSearch REST API
@@ -576,6 +576,42 @@ Fetch alerts raised by Alerting-plugin monitors — the "what is firing right no
 
 ---
 
+#### `opensearch_list_detectors`
+
+List OpenSearch Anomaly Detection detectors and the indices they watch. Use before pulling results with `opensearch_get_anomaly_results`.
+
+> Requires the Anomaly Detection plugin and detector-search privilege. Returns 403/404 otherwise.
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `size` | int | `50` | Max detectors to return |
+
+```json
+[{"id": "det1", "name": "srcip-beaconing", "description": "outbound beaconing", "indices": ["wazuh-alerts-*"], "detection_interval": {"period": {"interval": 10, "unit": "Minutes"}}}]
+```
+
+---
+
+#### `opensearch_get_anomaly_results`
+
+Fetch ML-detected anomalies (beaconing, spikes, rare activity), highest anomaly-grade first — no hand-written aggregations needed.
+
+> Requires the Anomaly Detection plugin. Returns 403/404 otherwise.
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `detector_id` | str | — | Restrict to one detector (recommended) |
+| `from_ts` | str | — | Filter on `data_end_time`, ISO 8601 UTC |
+| `to_ts` | str | — | Filter on `data_end_time`, ISO 8601 UTC |
+| `min_grade` | float | `0.0` | Only anomalies with `anomaly_grade` ≥ this (0–1). Raise to ~0.7 for high-confidence |
+| `size` | int | `50` | Max anomalies, highest grade first |
+
+```json
+{"total": 12, "anomalies": [{"detector_id": "det1", "anomaly_grade": 0.92, "confidence": 0.88, "data_start_time": 1719100200000, "data_end_time": 1719100800000}]}
+```
+
+---
+
 #### `opensearch_compare`
 
 Compare the top values of a field between two time windows. Returns a structured diff with added, removed, and changed values sorted by absolute delta. Prefer over calling `opensearch_terms` twice manually.
@@ -704,6 +740,7 @@ Some tools require elevated privileges or plugins not available on all deploymen
 | `opensearch_index_settings` | `indices:monitor/settings/get` | — |
 | `opensearch_ppl` | PPL plugin must be installed | `opensearch_search` (Lucene) |
 | `opensearch_list_monitors` / `opensearch_get_alerts` | Alerting plugin + alerting read privilege | — |
+| `opensearch_list_detectors` / `opensearch_get_anomaly_results` | Anomaly Detection plugin + AD read privilege | — |
 
 These tools return a structured error message (not a raw stack trace) when the privilege is missing. The `opensearch_test` tool includes the authenticated `username` in its response, which immediately clarifies why specific calls fail.
 

@@ -59,6 +59,8 @@ _ALLOWED_PATHS = {
         "/_msearch",
         "/_plugins/_ppl",
         "/_plugins/_alerting/monitors/_search",  # Alerting plugin: search monitors (read)
+        "/_plugins/_anomaly_detection/detectors/_search",          # AD plugin: search detectors (read)
+        "/_plugins/_anomaly_detection/detectors/results/_search",  # AD plugin: search results (read)
         "/api/console/proxy",   # Dashboards proxy (carries the real path)
     ],
 }
@@ -864,6 +866,82 @@ class OpenSearchClient:
             for a in result.get("alerts", [])
         ]
         return {"total": result.get("totalAlerts", len(alerts)), "alerts": alerts}
+
+    # ── Anomaly Detection plugin (read-only) ──────────────────
+
+    def list_detectors(self, size: int = 50) -> list:
+        """List configured Anomaly Detection detectors. Returns a summary per detector.
+
+        Requires the OpenSearch Anomaly Detection plugin and detector-search
+        privilege. Returns 403/404 if unavailable.
+        """
+        body = {"size": size, "query": {"match_all": {}}}
+        result = self._post("/_plugins/_anomaly_detection/detectors/_search", body=body)
+        out = []
+        for hit in result.get("hits", {}).get("hits", []):
+            src = hit.get("_source", {})
+            out.append({
+                "id": hit.get("_id"),
+                "name": src.get("name"),
+                "description": src.get("description"),
+                "indices": src.get("indices"),
+                "detection_interval": src.get("detection_interval"),
+            })
+        return out
+
+    def get_anomaly_results(
+        self,
+        detector_id: str = None,
+        from_ts: str = None,
+        to_ts: str = None,
+        min_grade: float = 0.0,
+        size: int = 50,
+    ) -> dict:
+        """Fetch anomaly results, most anomalous first.
+
+        detector_id: restrict to a single detector.
+        min_grade: only return results with anomaly_grade >= this (0-1); default 0
+                   returns anomalies only (grade > 0 is filtered when min_grade > 0).
+        from_ts/to_ts: filter on data_end_time (UTC ISO 8601).
+        Requires the Anomaly Detection plugin. Returns 403/404 if unavailable.
+        """
+        filters = []
+        if detector_id:
+            filters.append({"term": {"detector_id": detector_id}})
+        if min_grade and min_grade > 0:
+            filters.append({"range": {"anomaly_grade": {"gte": min_grade}}})
+        else:
+            filters.append({"range": {"anomaly_grade": {"gt": 0}}})
+        if from_ts or to_ts:
+            rng = {}
+            if from_ts:
+                rng["gte"] = from_ts
+            if to_ts:
+                rng["lte"] = to_ts
+            filters.append({"range": {"data_end_time": {**rng, "format": "strict_date_optional_time"}}})
+        body = {
+            "size": size,
+            "query": {"bool": {"filter": filters}},
+            "sort": [{"anomaly_grade": {"order": "desc"}}],
+        }
+        result = self._post(
+            "/_plugins/_anomaly_detection/detectors/results/_search", body=body
+        )
+        hits = result.get("hits", {})
+        total = hits.get("total", {})
+        if isinstance(total, dict):
+            total = total.get("value", 0)
+        anomalies = [
+            {
+                "detector_id": h.get("_source", {}).get("detector_id"),
+                "anomaly_grade": h.get("_source", {}).get("anomaly_grade"),
+                "confidence": h.get("_source", {}).get("confidence"),
+                "data_start_time": h.get("_source", {}).get("data_start_time"),
+                "data_end_time": h.get("_source", {}).get("data_end_time"),
+            }
+            for h in hits.get("hits", [])
+        ]
+        return {"total": total, "anomalies": anomalies}
 
 
 # ── Config loading ────────────────────────────────────────────────────────────
