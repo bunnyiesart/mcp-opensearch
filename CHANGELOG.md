@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.4.0] - 2026-07-31
+
+### Added
+- `opensearch_get_alerts` — fetch alerts raised by the OpenSearch Alerting plugin, filterable by state (ACTIVE/ACKNOWLEDGED/…) and monitor. Answers "what is firing right now?"
+- `opensearch_list_monitors` — list configured Alerting-plugin monitors (detection rules) and their enabled state.
+- `opensearch_timeline` — chronological event timeline for a single entity (IP, host, user) matched across multiple fields at once. The core DFIR pivot, previously requiring several manual `opensearch_search` calls.
+- `opensearch_list_detectors` — list Anomaly Detection-plugin detectors and the indices they watch.
+- `opensearch_get_anomaly_results` — fetch ML-detected anomalies (beaconing, spikes, rare activity), highest anomaly-grade first, filterable by detector, time range, and minimum grade.
+- `triage_alerts` prompt — SOC flow that pulls active alerts, maps them to monitors, then pivots on the top offending entity's timeline.
+- Read-only allowlist extended with the Alerting and Anomaly Detection read endpoints only. No write paths added — the read-only guarantee is unchanged.
+
 ## [0.3.4] - 2026-07-31
 
 ### Fixed

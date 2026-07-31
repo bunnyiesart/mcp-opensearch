@@ -23,8 +23,8 @@
 
 ## Features
 
-- **17 tools** covering connectivity checks, index/field discovery, full-text search, aggregations, time-series histograms, numeric stats, PPL queries, index settings, document explain, comparative analysis, and a generic GET escape hatch
-- **3 investigation prompts** — reusable templates for common log analysis workflows (single-agent investigation, top-offenders sweep, baseline comparison)
+- **22 tools** covering connectivity checks, index/field discovery, full-text search, entity timelines, aggregations, time-series histograms, numeric stats, PPL queries, index settings, document explain, comparative analysis, Alerting-plugin monitors and alerts, Anomaly Detection detectors and results, and a generic GET escape hatch
+- **4 investigation prompts** — reusable templates for common log analysis workflows (single-agent investigation, top-offenders sweep, alert triage, baseline comparison)
 - **Parallel requests** — all tools support concurrent execution; Claude Code can fire multiple queries in a single turn (e.g. `opensearch_count` + `opensearch_terms` + `opensearch_search` simultaneously) for faster investigations
 - Two backends: OpenSearch Dashboards proxy (preferred) or direct OpenSearch REST API
 - Hard limits on search result size (default 200) and histogram bucket count (default 2,000) to protect cluster health
@@ -349,6 +349,28 @@ Fastest way to check how many documents match a condition. Never returns documen
 
 ---
 
+#### `opensearch_timeline`
+
+Build a chronological event timeline for a single entity (IP, host, user) matched across several fields at once — the core DFIR pivot. Instead of running `opensearch_search` repeatedly to chase an entity through `data.srcip`, `data.dstip`, `agent.ip`, etc., this ORs all fields together and returns events oldest-first.
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `index` | str | — | Index name or wildcard |
+| `entity` | str | — | Value to trace, e.g. `"10.0.0.5"`, `"WIN-DC01"` |
+| `fields` | list | — | Fields the entity may appear in, e.g. `["data.srcip","data.dstip","agent.ip"]` |
+| `from_ts` | str | — | ISO 8601 UTC start time |
+| `to_ts` | str | — | ISO 8601 UTC end time |
+| `ts_field` | str | `"@timestamp"` | Timestamp field name |
+| `limit` | int | `100` | Max events, oldest-first (cap 200) |
+| `source_fields` | list | — | Fields to include per event (strongly recommended) |
+| `extra_query` | str | — | Optional Lucene filter ANDed with the entity match |
+
+```json
+{"total": 42, "entity": "10.0.0.5", "fields": ["data.srcip","data.dstip"], "events": [ ... ]}
+```
+
+---
+
 #### `opensearch_ppl`
 
 Execute a PPL (Piped Processing Language) query. Prefer over `opensearch_search` when you need multi-step pipeline operations (filter → stats → sort) in a single query. PPL is not interchangeable with Lucene — it uses a different syntax native to OpenSearch observability workloads.
@@ -520,6 +542,76 @@ Min/max/avg/std for a numeric field. Only works on numeric types (integer, float
 
 ---
 
+#### `opensearch_list_monitors`
+
+List OpenSearch Alerting-plugin monitors (detection rules) and whether they are enabled. Use to see what detections exist before investigating why something did — or did not — fire.
+
+> Requires the Alerting plugin and monitor-search privilege. Returns 403/404 otherwise.
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `size` | int | `50` | Max monitors to return |
+
+```json
+[{"id": "abc123", "name": "High severity alerts", "enabled": true, "type": "query_level_monitor", "schedule": {"period": {"interval": 1, "unit": "MINUTES"}}}]
+```
+
+---
+
+#### `opensearch_get_alerts`
+
+Fetch alerts raised by Alerting-plugin monitors — the "what is firing right now?" tool. Start a triage session here, then pivot on the offending entity with `opensearch_timeline`.
+
+> Requires the Alerting plugin. Returns 403/404 otherwise.
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `state` | str | — | Filter: `ACTIVE`, `ACKNOWLEDGED`, `COMPLETED`, `ERROR` |
+| `monitor_id` | str | — | Restrict to one monitor |
+| `size` | int | `50` | Max alerts, newest-first |
+
+```json
+{"total": 3, "alerts": [{"id": "a1", "monitor_name": "High severity alerts", "trigger_name": "level>=12", "state": "ACTIVE", "severity": "1", "start_time": 1719100800000}]}
+```
+
+---
+
+#### `opensearch_list_detectors`
+
+List OpenSearch Anomaly Detection detectors and the indices they watch. Use before pulling results with `opensearch_get_anomaly_results`.
+
+> Requires the Anomaly Detection plugin and detector-search privilege. Returns 403/404 otherwise.
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `size` | int | `50` | Max detectors to return |
+
+```json
+[{"id": "det1", "name": "srcip-beaconing", "description": "outbound beaconing", "indices": ["wazuh-alerts-*"], "detection_interval": {"period": {"interval": 10, "unit": "Minutes"}}}]
+```
+
+---
+
+#### `opensearch_get_anomaly_results`
+
+Fetch ML-detected anomalies (beaconing, spikes, rare activity), highest anomaly-grade first — no hand-written aggregations needed.
+
+> Requires the Anomaly Detection plugin. Returns 403/404 otherwise.
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `detector_id` | str | — | Restrict to one detector (recommended) |
+| `from_ts` | str | — | Filter on `data_end_time`, ISO 8601 UTC |
+| `to_ts` | str | — | Filter on `data_end_time`, ISO 8601 UTC |
+| `min_grade` | float | `0.0` | Only anomalies with `anomaly_grade` ≥ this (0–1). Raise to ~0.7 for high-confidence |
+| `size` | int | `50` | Max anomalies, highest grade first |
+
+```json
+{"total": 12, "anomalies": [{"detector_id": "det1", "anomaly_grade": 0.92, "confidence": 0.88, "data_start_time": 1719100200000, "data_end_time": 1719100800000}]}
+```
+
+---
+
 #### `opensearch_compare`
 
 Compare the top values of a field between two time windows. Returns a structured diff with added, removed, and changed values sorted by absolute delta. Prefer over calling `opensearch_terms` twice manually.
@@ -638,7 +730,7 @@ Compare alert patterns between a baseline period and a selection period. Uses `o
 
 ## Known Limitations
 
-Four tools require elevated privileges not available on all deployments:
+Some tools require elevated privileges or plugins not available on all deployments:
 
 | Tool | Required privilege | Alternative |
 |---|---|---|
@@ -647,6 +739,8 @@ Four tools require elevated privileges not available on all deployments:
 | `opensearch_get_mapping` | `indices:admin/mappings/get` | `opensearch_discover_fields` |
 | `opensearch_index_settings` | `indices:monitor/settings/get` | — |
 | `opensearch_ppl` | PPL plugin must be installed | `opensearch_search` (Lucene) |
+| `opensearch_list_monitors` / `opensearch_get_alerts` | Alerting plugin + alerting read privilege | — |
+| `opensearch_list_detectors` / `opensearch_get_anomaly_results` | Anomaly Detection plugin + AD read privilege | — |
 
 These tools return a structured error message (not a raw stack trace) when the privilege is missing. The `opensearch_test` tool includes the authenticated `username` in its response, which immediately clarifies why specific calls fail.
 
