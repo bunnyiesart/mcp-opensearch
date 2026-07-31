@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.3.4] - 2026-07-31
+
+### Fixed
+- `opensearch_api`: array responses (e.g. the `_cat/*` APIs) previously crashed with a FastMCP "structured_content must be a dict" error. Array responses are now wrapped as `{"result": [...]}`.
+
 ## [0.3.3] - 2026-07-31
 
 ### Fixed

@@ -129,7 +129,7 @@ class OpenSearchClient:
             "Accept": "application/json",
             "Content-Type": "application/json",
             "osd-xsrf": "true",
-            "User-Agent": "mcp-opensearch/0.3.3",
+            "User-Agent": "mcp-opensearch/0.3.4",
         })
 
         retry = Retry(
