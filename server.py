@@ -9,6 +9,7 @@ Exposes:
   opensearch_get_mapping         — flattened field types for an index
   opensearch_discover_fields     — discover fields by sampling documents
   opensearch_search              — Lucene query string search
+  opensearch_timeline            — chronological event timeline for one entity across fields
   opensearch_count               — count matching documents
   opensearch_terms               — top N values of a field
   opensearch_multi_terms         — multiple field frequency analyses in one call
@@ -18,11 +19,16 @@ Exposes:
   opensearch_api                 — escape hatch: any read GET endpoint
   opensearch_explain             — explain why a document matches a query
   opensearch_index_settings      — shard count, replicas, ILM policy, refresh interval
+  opensearch_list_monitors       — list Alerting-plugin monitors (detection rules)
+  opensearch_get_alerts          — fetch alerts raised by Alerting-plugin monitors
+  opensearch_list_detectors      — list Anomaly Detection detectors
+  opensearch_get_anomaly_results — fetch detected anomalies, most anomalous first
   opensearch_compare             — diff top field values across two time windows
 
 Prompts:
   investigate_alert              — step-by-step single-agent investigation
   top_offenders                  — find top agents, rules, and IPs in a window
+  triage_alerts                  — pull active alerts, then pivot on the top entity
   compare_time_windows           — compare alert patterns between two periods
 
 Credentials (env vars or ~/.config/mcp-opensearch/config.json):
@@ -249,6 +255,55 @@ def opensearch_count(
         from_ts=from_ts,
         to_ts=to_ts,
         ts_field=ts_field,
+    )
+
+
+@mcp.tool()
+def opensearch_timeline(
+    index: str,
+    entity: str,
+    fields: list,
+    from_ts: Optional[str] = None,
+    to_ts: Optional[str] = None,
+    ts_field: str = "@timestamp",
+    limit: int = 100,
+    source_fields: Optional[list] = None,
+    extra_query: Optional[str] = None,
+) -> dict:
+    """Build a chronological event timeline for a single entity (IP, user, host) across fields.
+
+    The core DFIR pivot: instead of running opensearch_search several times to chase
+    one entity through source/destination/agent fields, this matches the entity against
+    ALL given fields at once (OR) and returns events oldest-first. Always pass
+    source_fields to keep the response small, and a time range to keep it fast.
+
+    Args:
+        index: Index name or wildcard pattern, e.g. "wazuh-alerts-*".
+        entity: The value to trace, e.g. "10.0.0.5", "WIN-DC01", "jdoe".
+        fields: Fields the entity may appear in, e.g.
+                ["data.srcip", "data.dstip", "agent.ip", "agent.name"].
+        from_ts: Start time, UTC ISO 8601, e.g. "2026-06-23T00:00:00Z".
+        to_ts: End time, UTC ISO 8601.
+        ts_field: Timestamp field name (default "@timestamp").
+        limit: Max events to return, oldest-first (default 100, hard cap 200).
+        source_fields: Fields to include per event — strongly recommended, e.g.
+                       ["@timestamp", "rule.description", "rule.level", "data.srcip", "data.dstip"].
+        extra_query: Optional Lucene filter ANDed with the entity match,
+                     e.g. "rule.level:[10 TO *]".
+
+    Returns:
+        {"total": N, "entity": str, "fields": [...], "events": [doc, ...]}
+    """
+    return get_client().timeline(
+        index,
+        entity,
+        fields,
+        from_ts=from_ts,
+        to_ts=to_ts,
+        ts_field=ts_field,
+        limit=limit,
+        source_fields=source_fields,
+        extra_query=extra_query,
     )
 
 
@@ -525,6 +580,103 @@ def opensearch_index_settings(index: str) -> dict:
     return get_client().index_settings(index)
 
 
+# ── Alerting (read-only) ────────────────────────────────────────────────────────
+
+@mcp.tool()
+def opensearch_list_monitors(size: int = 50) -> list:
+    """List OpenSearch Alerting-plugin monitors (detection rules) and whether they are enabled.
+
+    Use to see what detections exist before investigating why something did — or did not —
+    fire. Pair with opensearch_get_alerts to see what those monitors actually raised.
+    Requires the Alerting plugin and monitor-search privilege; returns 403/404 otherwise.
+
+    Args:
+        size: Max monitors to return (default 50).
+
+    Returns:
+        [{"id", "name", "enabled", "type", "schedule"}, ...]
+    """
+    return get_client().list_monitors(size=size)
+
+
+@mcp.tool()
+def opensearch_get_alerts(
+    state: Optional[str] = None,
+    monitor_id: Optional[str] = None,
+    size: int = 50,
+) -> dict:
+    """Fetch alerts raised by Alerting-plugin monitors — the "what is firing right now?" tool.
+
+    Start a triage session here: pull ACTIVE alerts, then pivot on the offending entity
+    with opensearch_timeline. Requires the Alerting plugin; returns 403/404 otherwise.
+
+    Args:
+        state: Filter by state — "ACTIVE", "ACKNOWLEDGED", "COMPLETED", "ERROR".
+               Omit for all states.
+        monitor_id: Restrict to one monitor (get IDs from opensearch_list_monitors).
+        size: Max alerts to return, newest-first (default 50).
+
+    Returns:
+        {"total": N, "alerts": [{"id", "monitor_name", "trigger_name", "state",
+                                 "severity", "start_time", ...}, ...]}
+    """
+    return get_client().get_alerts(state=state, monitor_id=monitor_id, size=size)
+
+
+# ── Anomaly Detection (read-only) ────────────────────────────────────────────────
+
+@mcp.tool()
+def opensearch_list_detectors(size: int = 50) -> list:
+    """List OpenSearch Anomaly Detection detectors and the indices they watch.
+
+    Use to see what anomaly detectors exist before pulling their results with
+    opensearch_get_anomaly_results. Requires the Anomaly Detection plugin and
+    detector-search privilege; returns 403/404 otherwise.
+
+    Args:
+        size: Max detectors to return (default 50).
+
+    Returns:
+        [{"id", "name", "description", "indices", "detection_interval"}, ...]
+    """
+    return get_client().list_detectors(size=size)
+
+
+@mcp.tool()
+def opensearch_get_anomaly_results(
+    detector_id: Optional[str] = None,
+    from_ts: Optional[str] = None,
+    to_ts: Optional[str] = None,
+    min_grade: float = 0.0,
+    size: int = 50,
+) -> dict:
+    """Fetch detected anomalies (beaconing, spikes, rare activity), most anomalous first.
+
+    Surfaces ML-detected anomalies without hand-writing aggregations. Get detector IDs
+    from opensearch_list_detectors. Requires the Anomaly Detection plugin; returns
+    403/404 otherwise.
+
+    Args:
+        detector_id: Restrict to one detector (recommended).
+        from_ts: Start time filter on data_end_time, UTC ISO 8601.
+        to_ts: End time filter on data_end_time, UTC ISO 8601.
+        min_grade: Only return anomalies with anomaly_grade >= this (0-1). Default 0
+                   returns all real anomalies (grade > 0). Raise to ~0.7 for high-confidence.
+        size: Max anomalies to return, highest grade first (default 50).
+
+    Returns:
+        {"total": N, "anomalies": [{"detector_id", "anomaly_grade", "confidence",
+                                    "data_start_time", "data_end_time"}, ...]}
+    """
+    return get_client().get_anomaly_results(
+        detector_id=detector_id,
+        from_ts=from_ts,
+        to_ts=to_ts,
+        min_grade=min_grade,
+        size=size,
+    )
+
+
 @mcp.tool()
 def opensearch_compare(
     index: str,
@@ -671,6 +823,33 @@ After collecting results:
 2. Identify any rule IDs with unusually high counts — look up the rule description.
 3. Flag any IP that appears in both source and destination lists (possible pivot point).
 4. Note any spikes in the histogram and correlate with the top agents/rules at that time.
+"""
+
+
+@mcp.prompt()
+def triage_alerts(index: str) -> str:
+    """SOC triage flow: pull active alerts, then pivot on the top offending entity."""
+    return f"""Triage the current security alerts, then investigate the most urgent entity.
+
+Step 1 — See what is firing:
+  opensearch_get_alerts(state='ACTIVE', size=50)
+
+Step 2 — Understand the detections behind them (only if alerts exist):
+  opensearch_list_monitors()
+  Map each alert's monitor_name/trigger_name to what the monitor is meant to catch.
+
+Step 3 — Pick the highest-severity / most-frequent alert and identify its entity
+  (source IP, host, or user) from the alert or a quick lookup in '{index}'.
+
+Step 4 — Pivot: build a full timeline for that entity across all relevant fields:
+  opensearch_timeline(index='{index}', entity='<value>',
+      fields=['data.srcip','data.dstip','agent.ip','agent.name'],
+      from_ts='<alert start - 1h>', to_ts='<now>',
+      source_fields=['@timestamp','rule.level','rule.description','data.srcip','data.dstip'])
+
+Step 5 — Summarize: Is this a true positive? What is the first and last activity for
+  this entity? Any lateral movement (multiple destinations) or privilege escalation?
+  Recommend acknowledge / escalate / tune-the-rule.
 """
 
 
