@@ -8,6 +8,8 @@ Auth: basic auth (username + password).
 Config priority: env vars > ~/.config/mcp-opensearch/config.json
 """
 
+from __future__ import annotations
+
 import json
 import logging
 import os
@@ -15,6 +17,8 @@ import posixpath
 import re
 import stat
 from datetime import datetime, timezone
+from importlib.metadata import PackageNotFoundError
+from importlib.metadata import version as _pkg_version
 from urllib.parse import urlencode
 
 import requests
@@ -30,40 +34,181 @@ CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
 BACKEND_DASHBOARDS = "dashboards"
 BACKEND_OPENSEARCH = "opensearch"
 
-MAX_SEARCH_LIMIT = 200        # hard cap on search result size
-MAX_HISTOGRAM_BUCKETS = 2000  # reject histograms that would exceed this
-MAX_SAMPLE_SIZE = 100         # hard cap on discover_fields sample_size
 
-# Interval string → seconds
+def _package_version() -> str:
+    """This package's version, from distribution metadata.
+
+    pyproject.toml is the single authoritative version (ADR 0003), so it must not
+    be duplicated as a literal here. The package is frequently run straight from
+    a source checkout, where no distribution metadata exists — that must degrade
+    to an honest "unknown" rather than raising at import and taking down server
+    startup.
+    """
+    try:
+        return _pkg_version("mcp-opensearch")
+    except PackageNotFoundError:
+        return "unknown"
+
+
+MAX_SEARCH_LIMIT = 200        # default cap on search result size, overridable via OPENSEARCH_MAX_SEARCH_LIMIT
+MAX_HISTOGRAM_BUCKETS = 2000  # default cap on histogram buckets, overridable via OPENSEARCH_MAX_HISTOGRAM_BUCKETS
+MAX_SAMPLE_SIZE = 100         # hard cap on discover_fields sample_size (no override)
+MAX_TERMS_SIZE = 1000         # default cap on a terms agg `size`, overridable via OPENSEARCH_MAX_TERMS_SIZE
+MAX_AGGREGATIONS = 20         # default cap on multi_terms agg count, overridable via OPENSEARCH_MAX_AGGREGATIONS
+
+# Interval string → seconds. The w/M/y values are nominal (7d / 30d / 365d) and
+# are used only to estimate a bucket count locally; the cluster does the real
+# calendar arithmetic. See _CALENDAR_UNITS.
 _INTERVAL_SECONDS = {
     "s": 1, "m": 60, "h": 3600, "d": 86400,
     "w": 604800, "M": 2592000, "y": 31536000,
 }
 _INTERVAL_RE = re.compile(r"^(\d+)([smhdwMy])$")
 
-# Read-only path allowlist — suffix match
-# e.g. /wazuh-alerts-*/_search matches "/_search"
+# Units OpenSearch accepts only in `calendar_interval`, never in
+# `fixed_interval`. calendar_interval additionally accepts a multiplier of 1
+# only, which _parse_interval enforces.
+_CALENDAR_UNITS = frozenset({"w", "M", "y"})
+
+# Timestamp normalisation for _parse_ts, applied to the part after the "T" only
+# (a date like "2024-01-01" ends in something an offset pattern would match).
+_TS_FRACTION_RE = re.compile(r"\.(\d+)")
+_TS_OFFSET_NO_COLON_RE = re.compile(r"([+-])(\d{2})(\d{2})$")
+_TS_OFFSET_HOURS_ONLY_RE = re.compile(r"([+-])(\d{2})$")
+
+# Read-only path allowlist — the single enforcement point for outbound requests.
+#
+# Two match kinds, because OpenSearch paths come in two shapes and a plain
+# suffix match is wrong for one of them:
+#
+#   "absolute" — cluster- or plugin-level endpoints. Matches the entry itself or
+#                any sub-resource below it, so "/_cat" covers
+#                "/_cat/indices/my_create_index" and "/_nodes/stats" covers
+#                "/_nodes/stats/jvm". A suffix match would reject both.
+#   "indexed"  — index-scoped endpoints: first segment is the index name or
+#                wildcard pattern, second is the action. "/_search" covers
+#                "/wazuh-alerts-*/_search"; "/_explain" covers
+#                "/my-index/_explain/<doc_id>", which no suffix match can express.
+#                The index segment must not start with "_", so a crafted index
+#                like "_cluster/settings" cannot smuggle in a cluster endpoint.
+#
+# Criterion for an entry: read-only AND not a credential/secret surface.
+# Deliberately NOT allowlisted, and must stay that way:
+#   /_plugins/_security/*  — internal user database, password hashes, roles
+#   /_cluster/settings, /_cluster/state — carry snapshot repository credentials
+#   /_snapshot/*           — repository definitions incl. cloud credentials
+#   /_nodes (bare)         — node info echoes opensearch.yml settings
 _ALLOWED_PATHS = {
-    "GET": [
-        "/_cat/indices",
-        "/_cluster/health",
-        "/_mapping",
-        "/_settings",
-        "/api/status",
-        "/api/saved_objects/_find",
-        "/_plugins/_alerting/monitors/alerts",  # Alerting plugin: active alerts (read)
-    ],
-    "POST": [
-        "/_search",
-        "/_count",
-        "/_msearch",
-        "/_plugins/_ppl",
-        "/_plugins/_alerting/monitors/_search",  # Alerting plugin: search monitors (read)
-        "/_plugins/_anomaly_detection/detectors/_search",          # AD plugin: search detectors (read)
-        "/_plugins/_anomaly_detection/detectors/results/_search",  # AD plugin: search results (read)
-        "/api/console/proxy",   # Dashboards proxy (carries the real path)
-    ],
+    "GET": {
+        "absolute": [
+            "/_cat",                    # whole _cat family is GET-only and read-only
+            "/_cluster/health",
+            "/_cluster/stats",
+            "/_cluster/pending_tasks",
+            "/_nodes/stats",
+            "/_nodes/usage",
+            "/_nodes/hot_threads",
+            "/_alias",                  # cluster-wide alias listing
+            "/_mapping",                # cluster-wide mapping / _mapping/field/*
+            "/_template",
+            "/_index_template",
+            "/_plugins/_ism/policies",  # ISM policies (read); GET only
+            "/_plugins/_ism/explain",
+            "/_plugins/_alerting/monitors/alerts",  # Alerting plugin: alerts (read)
+            "/api/status",                          # Dashboards
+            "/api/saved_objects/_find",             # Dashboards
+            "/api/data_views",                      # Dashboards (newer versions)
+        ],
+        "indexed": [
+            "/_mapping",
+            "/_settings",
+            "/_alias",
+            "/_stats",
+            "/_shard_stores",
+        ],
+    },
+    "POST": {
+        "absolute": [
+            "/_search",
+            "/_count",
+            "/_msearch",
+            "/_plugins/_ppl",
+            "/_plugins/_alerting/monitors/_search",  # Alerting plugin: search monitors (read)
+            "/_plugins/_anomaly_detection/detectors/_search",          # AD plugin: search detectors (read)
+            "/_plugins/_anomaly_detection/detectors/results/_search",  # AD plugin: search results (read)
+            # /api/console/proxy is deliberately NOT here. It is a tunnel: the
+            # real method and path travel in its query string, so allowlisting
+            # it would allow anything. _dashboards_proxy() builds that request
+            # itself, from a path _check_path has already approved.
+        ],
+        "indexed": [
+            "/_search",
+            "/_count",
+            "/_msearch",
+            "/_explain",
+        ],
+    },
 }
+
+
+def _dig(data, *keys) -> dict:
+    """Walk nested dicts, treating a present-but-null key exactly like a missing one.
+
+    `d.get(k, {}).get(x)` only defends against `k` being *absent*: OpenSearch
+    routinely sends the key with a JSON null instead (a detached ISM policy, an
+    empty aggregation envelope), and the chained `.get` then raises
+    AttributeError on None. Post-condition: always returns a dict, so the result
+    is safe to chain.
+    """
+    current = data
+    for key in keys:
+        if not isinstance(current, dict):
+            return {}
+        value = current.get(key)
+        current = {} if value is None else value
+    return current if isinstance(current, dict) else {}
+
+
+def _val(data, key: str, default=None):
+    """`data[key]`, falling back to `default` when the key is absent OR null."""
+    if not isinstance(data, dict):
+        return default
+    value = data.get(key)
+    return default if value is None else value
+
+
+def _items(data, key: str) -> list:
+    """The list at `data[key]`, or [] when it is absent, null or not a list."""
+    value = data.get(key) if isinstance(data, dict) else None
+    return value if isinstance(value, list) else []
+
+
+def _matches_allowlist(path: str, rules: dict) -> bool:
+    """True when `path` (query string already stripped, normalised) is allowed.
+
+    See _ALLOWED_PATHS for the meaning of the "absolute" and "indexed" kinds.
+    """
+    for entry in rules.get("absolute", ()):
+        if path == entry or path.startswith(entry + "/"):
+            return True
+    parts = path.split("/")
+    # ["", "<index>", "<_action>", ...] — index must not masquerade as an endpoint
+    return (
+        len(parts) >= 3
+        and parts[0] == ""
+        and bool(parts[1])
+        and not parts[1].startswith("_")
+        and f"/{parts[2]}" in rules.get("indexed", ())
+    )
+
+
+def _allowlist_hint(method: str) -> str:
+    """Human-readable summary of what `method` may reach, built from the allowlist."""
+    rules = _ALLOWED_PATHS.get(method, {})
+    absolute = ", ".join(rules.get("absolute", ())) or "none"
+    indexed = ", ".join(f"/<index>{e}" for e in rules.get("indexed", ())) or "none"
+    return f"Allowed {method} paths: {absolute}, {indexed}"
+
 
 _NO_TIME_RANGE_WARNING = (
     "No time range specified — this query scans the full index history "
@@ -71,22 +216,58 @@ _NO_TIME_RANGE_WARNING = (
 )
 
 
-# Field name fragments that strongly suggest an analyzed text type.
-# Keyword fields (agent.name, rule.id, data.srcip, etc.) don't match these.
+# Whole-word hints that suggest an analyzed text type. Each entry is a single
+# token: matching is token equality, never substring containment, because the
+# short hints ("log", "text") occur inside plenty of keyword field names —
+# logonType, logonProcessName, catalogId, logger — and a false positive tells the
+# analyst to append `.keyword` to a field that has none.
+# Keyword fields (agent.name, rule.id, data.srcip, etc.) match nothing here.
 _TEXT_FIELD_HINTS = (
-    "description", "message", "full_log", "log", "content",
+    "description", "message", "log", "content",
     "text", "comment", "detail", "summary", "reason", "output",
+    "commandline", "cmdline",
 )
+
+# Tokenises a field-name segment: an all-caps run, a CamelCase word, or a
+# lowercase/digit run. Non-alphanumerics (_ - @ etc.) are separators.
+_SEGMENT_TOKEN_RE = re.compile(r"[A-Z]+(?![a-z])|[A-Z][a-z0-9]*|[a-z0-9]+")
+
+
+def _segment_tokens(segment: str) -> list:
+    """Lowercase word tokens of one field-name segment.
+
+    "logonType" → ["logon", "type"]; "full_log" → ["full", "log"];
+    "DESCRIPTION" → ["description"]; "command_line" → ["command", "line"].
+    """
+    return [t.lower() for t in _SEGMENT_TOKEN_RE.findall(segment)]
 
 
 def _is_likely_text_field(field: str) -> bool:
-    """Heuristic: true when the field name suggests an analyzed text type."""
-    last = field.rsplit(".", 1)[-1].lower()
-    return any(hint in last for hint in _TEXT_FIELD_HINTS)
+    """Heuristic: true when the field name suggests an analyzed text type.
+
+    Only the last dotted segment is examined, and only whole tokens count. The
+    de-separated segment ("command_line" → "commandline") is also compared, so
+    the three spellings of the same field name behave identically.
+    """
+    tokens = _segment_tokens(field.rsplit(".", 1)[-1])
+    if not tokens:
+        return False
+    joined = "".join(tokens)
+    token_set = set(tokens)
+    return any(hint in token_set or hint == joined for hint in _TEXT_FIELD_HINTS)
 
 
 def _flatten_doc(doc: dict, prefix: str = "") -> dict:
-    """Recursively flatten a nested document to dot-notation keys."""
+    """Recursively flatten a nested document to dot-notation keys.
+
+    Arrays are descended into: an array of objects contributes its own entry
+    (typed "list", so the array is still visible) plus one entry per leaf inside
+    its elements, at the dotted path OpenSearch itself queries — `rule.mitre.id`,
+    not `rule.mitre[0].id`. Element structures are unioned across the array; on a
+    type conflict the last element wins, the same rule discover_fields already
+    applies across sampled documents. An array of scalars keeps only its own
+    "list" entry, since its elements have no field names to report.
+    """
     out = {}
     for k, v in doc.items():
         full = f"{prefix}.{k}" if prefix else k
@@ -94,6 +275,32 @@ def _flatten_doc(doc: dict, prefix: str = "") -> dict:
             out.update(_flatten_doc(v, prefix=full))
         else:
             out[full] = type(v).__name__
+            if isinstance(v, list):
+                out.update(_flatten_list(v, prefix=full))
+    return out
+
+
+def _bucket_label(bucket: dict) -> str | None:
+    """The label for a date_histogram bucket, or None when it has no identity.
+
+    `key_as_string` is preferred and `key` is the fallback — evaluated lazily,
+    because `b.get("key_as_string", str(b["key"]))` indexes `key` on every bucket
+    and so raised KeyError on a bucket that carried only the label.
+    """
+    label = bucket.get("key_as_string")
+    if label is None:
+        label = bucket.get("key")
+    return None if label is None else str(label)
+
+
+def _flatten_list(values: list, prefix: str) -> dict:
+    """Leaf fields inside an array, at `prefix`-relative dotted paths."""
+    out = {}
+    for item in values:
+        if isinstance(item, dict):
+            out.update(_flatten_doc(item, prefix=prefix))
+        elif isinstance(item, list):
+            out.update(_flatten_list(item, prefix=prefix))
     return out
 
 
@@ -101,7 +308,24 @@ class OpenSearchClient:
     """Read-only client for OpenSearch / OpenSearch Dashboards.
 
     On first use, probes Dashboards (/api/status). On failure, falls back to
-    direct OpenSearch. All writes are blocked via _check_path().
+    direct OpenSearch.
+
+    Guarantee: every request this class issues goes out through _get or _post,
+    and both call _check_path() first, so only paths on the _ALLOWED_PATHS
+    read-only allowlist can be reached — there is no bypass method. The
+    allowlist is a positive list of read endpoints, not a denylist of write
+    ones, so an unknown endpoint is refused rather than permitted.
+
+    What it does NOT guarantee: the backend's own RBAC still decides what the
+    authenticated user may read. The allowlist keeps this client away from
+    credential surfaces (security plugin, snapshot repositories, cluster
+    settings), but it is not a substitute for a least-privilege account.
+
+    Three methods call self._session directly instead of _get/_post:
+    _resolve_backend() probes GET /api/status and GET / for version discovery,
+    _dashboards_proxy() posts the already-checked path to the Dashboards console
+    proxy, and list_index_patterns() reads the Dashboards saved-objects APIs.
+    None of them takes a caller-supplied path.
     """
 
     def __init__(
@@ -114,6 +338,8 @@ class OpenSearchClient:
         timeout=60,
         max_search_limit=MAX_SEARCH_LIMIT,
         max_histogram_buckets=MAX_HISTOGRAM_BUCKETS,
+        max_terms_size=MAX_TERMS_SIZE,
+        max_aggregations=MAX_AGGREGATIONS,
     ):
         self.dashboards_url = dashboards_url.rstrip("/") if dashboards_url else None
         self.opensearch_url = opensearch_url.rstrip("/") if opensearch_url else None
@@ -121,6 +347,8 @@ class OpenSearchClient:
         self.timeout = timeout
         self.max_search_limit = max_search_limit
         self.max_histogram_buckets = max_histogram_buckets
+        self.max_terms_size = max_terms_size
+        self.max_aggregations = max_aggregations
         self.backend = None
         self.server_version = None
         self.last_query_ms = 0
@@ -133,7 +361,7 @@ class OpenSearchClient:
             "Accept": "application/json",
             "Content-Type": "application/json",
             "osd-xsrf": "true",
-            "User-Agent": "mcp-opensearch/0.4.0",
+            "User-Agent": f"mcp-opensearch/{_package_version()}",
         })
 
         retry = Retry(
@@ -149,22 +377,38 @@ class OpenSearchClient:
     # ── Read-only guard ───────────────────────────────────────
 
     def _check_path(self, method: str, path: str):
-        """Block any path not in the read-only allowlist.
+        """Refuse any request that is not on the read-only allowlist.
 
-        Uses suffix-match so /wazuh-alerts-*/_search passes "/_search".
+        Pre-condition: `path` is an absolute OpenSearch path starting with "/".
+        Post-condition: returns None only for paths allowed for `method`; every
+        other path raises. This is the only guard, and _get/_post are the only
+        ways out of this class, so it cannot be bypassed by a caller.
+
+        Raises:
+            ValueError: path is not an absolute path.
+            PermissionError: path contains traversal segments, or is not on the
+                allowlist for this method. The message names the allowed paths.
         """
+        if not isinstance(path, str) or not path.startswith("/"):
+            raise ValueError(f"path must be an absolute path starting with '/'. Got: {path!r}")
         raw = path.split("?")[0]
-        clean = posixpath.normpath(raw)
-        if clean != raw:
+        clean = raw.rstrip("/") or "/"
+        if posixpath.normpath(clean) != clean:
             raise PermissionError(
-                f"Blocked {method} {path} — path traversal detected."
+                f"Blocked {method} {path} — path traversal detected. "
+                "Paths must not contain '.' or '..' segments."
             )
-        allowed = _ALLOWED_PATHS.get(method, [])
-        if not any(clean == p or clean.endswith(p) for p in allowed):
-            raise PermissionError(
-                f"Blocked {method} {path} — not in the read-only allowlist. "
-                "Only search, count, mapping, and discovery calls are permitted."
-            )
+        if _matches_allowlist(clean, _ALLOWED_PATHS.get(method, {})):
+            return
+        raise PermissionError(
+            f"Blocked {method} {path} — not on the read-only allowlist. "
+            f"{_allowlist_hint(method)}. "
+            "Entries shown as /<index>/... accept any index name or wildcard "
+            "pattern, e.g. /wazuh-alerts-*/_search. Security, snapshot and "
+            "cluster-settings endpoints are never reachable from this server; "
+            "prefer the dedicated tools for search, count, mapping, settings "
+            "and aggregations."
+        )
 
     # ── Structured error handling ─────────────────────────────
 
@@ -209,7 +453,7 @@ class OpenSearchClient:
                 if r.status_code == 200:
                     data = r.json()
                     self.backend = BACKEND_DASHBOARDS
-                    self.server_version = data.get("version", {}).get("number", "?")
+                    self.server_version = _val(_dig(data, "version"), "number", "?")
                     logger.info(
                         "Backend: OpenSearch Dashboards %s (v%s)",
                         self.dashboards_url, self.server_version,
@@ -232,7 +476,7 @@ class OpenSearchClient:
                 self._raise_for_status(r, "GET /")
                 data = r.json()
                 self.backend = BACKEND_OPENSEARCH
-                self.server_version = data.get("version", {}).get("number", "?")
+                self.server_version = _val(_dig(data, "version"), "number", "?")
                 logger.info(
                     "Backend: direct OpenSearch %s (v%s)",
                     self.opensearch_url, self.server_version,
@@ -248,7 +492,7 @@ class OpenSearchClient:
 
     # ── Low-level requests ────────────────────────────────────
 
-    def _get(self, path: str, params: dict = None) -> dict:
+    def _get(self, path: str, params: dict | None = None) -> dict:
         self._check_path("GET", path)
         self._resolve_backend()
         if self.backend == BACKEND_DASHBOARDS:
@@ -263,7 +507,7 @@ class OpenSearchClient:
         self.last_query_ms = int(r.elapsed.total_seconds() * 1000)
         return r.json()
 
-    def _post(self, path: str, body: dict = None, params: dict = None) -> dict:
+    def _post(self, path: str, body: dict | None = None, params: dict | None = None) -> dict:
         self._check_path("POST", path)
         self._resolve_backend()
         if self.backend == BACKEND_DASHBOARDS:
@@ -280,7 +524,7 @@ class OpenSearchClient:
         return r.json()
 
     def _dashboards_proxy(
-        self, method: str, path: str, body: dict = None, params: dict = None
+        self, method: str, path: str, body: dict | None = None, params: dict | None = None
     ) -> dict:
         """Route an OpenSearch request through Dashboards /api/console/proxy."""
         os_path = path.lstrip("/")
@@ -327,12 +571,23 @@ class OpenSearchClient:
     # ── Mapping helper ────────────────────────────────────────
 
     def _flatten_mapping(self, properties: dict, prefix: str = "") -> dict:
+        """Flatten a mapping's `properties` tree to {dotted_field: type}.
+
+        Both nesting keys are followed: `properties` (sub-objects) and `fields`
+        (multi-fields). The latter is what makes `rule.description.keyword`
+        visible — the exact remediation every aggregation warning advises, which
+        was previously absent from get_mapping's answer.
+        """
         fields = {}
         for name, cfg in properties.items():
             full = f"{prefix}.{name}" if prefix else name
-            fields[full] = cfg.get("type", "object")
-            if "properties" in cfg:
-                fields.update(self._flatten_mapping(cfg["properties"], prefix=full))
+            if not isinstance(cfg, dict):
+                continue
+            fields[full] = _val(cfg, "type", "object")
+            for nesting_key in ("properties", "fields"):
+                sub = cfg.get(nesting_key)
+                if isinstance(sub, dict):
+                    fields.update(self._flatten_mapping(sub, prefix=full))
         return fields
 
     # ── Public read-only API ──────────────────────────────────
@@ -363,7 +618,7 @@ class OpenSearchClient:
             params={"format": "json", "h": "index,docs.count,store.size,health,status"},
         )
         if isinstance(data, list):
-            return sorted(data, key=lambda x: x.get("index", ""))
+            return sorted(data, key=lambda x: str(_val(x, "index", "")))
         return data
 
     def list_index_patterns(self) -> list:
@@ -382,10 +637,10 @@ class OpenSearchClient:
                 lambda data: [
                     {
                         "id": p.get("id"),
-                        "title": p.get("attributes", {}).get("title"),
-                        "timeFieldName": p.get("attributes", {}).get("timeFieldName"),
+                        "title": _val(_dig(p, "attributes"), "title"),
+                        "timeFieldName": _val(_dig(p, "attributes"), "timeFieldName"),
                     }
-                    for p in data.get("saved_objects", [])
+                    for p in _items(data, "saved_objects")
                 ],
             ),
             (
@@ -397,7 +652,7 @@ class OpenSearchClient:
                         "title": p.get("title"),
                         "timeFieldName": p.get("timeFieldName"),
                     }
-                    for p in data.get("data_view", [])
+                    for p in _items(data, "data_view")
                 ],
             ),
         ]:
@@ -421,23 +676,27 @@ class OpenSearchClient:
         """Flattened field mappings for an index. Returns {index: {field: type}}."""
         result = self._get(f"/{index}/_mapping")
         return {
-            idx: self._flatten_mapping(mapping.get("mappings", {}).get("properties", {}))
-            for idx, mapping in result.items()
+            idx: self._flatten_mapping(_dig(mapping, "mappings", "properties"))
+            for idx, mapping in _dig(result).items()
         }
 
     def discover_fields(
         self,
         index: str,
         query_string: str = "*",
-        from_ts: str = None,
-        to_ts: str = None,
+        from_ts: str | None = None,
+        to_ts: str | None = None,
         ts_field: str = "@timestamp",
         sample_size: int = 10,
     ) -> dict:
         """Sample documents and return {field_name: python_type} in dot-notation.
 
-        Nested fields are flattened: agent.name, rule.level, etc.
+        Nested fields and fields inside arrays of objects are flattened:
+        agent.name, rule.level, rule.mitre.id.
         sample_size is capped at MAX_SAMPLE_SIZE to prevent large fetches.
+
+        Adds a "_warning" key when the sample size is capped and/or no time range
+        is given; both messages are joined with " | ", as search_string does.
         """
         capped = min(sample_size, MAX_SAMPLE_SIZE)
         result = self.search_string(
@@ -449,49 +708,77 @@ class OpenSearchClient:
             limit=capped,
         )
         fields = {}
-        for hit in result.get("hits", []):
+        for hit in _items(result, "hits"):
             fields.update(_flatten_doc(hit))
         out = dict(sorted(fields.items()))
+        warnings = []
         if capped < sample_size:
-            out["_warning"] = (
+            warnings.append(
                 f"sample_size capped at {capped} (requested {sample_size}). "
                 f"Maximum is {MAX_SAMPLE_SIZE}."
             )
+        # search_string's own warnings (no time range, limit cap) would otherwise
+        # be dropped on the floor: this method reads only `hits` from its result.
+        inherited = result.get("warning")
+        if inherited:
+            warnings.append(inherited)
+        if warnings:
+            out["_warning"] = " | ".join(warnings)
         return out
 
     def search_string(
         self,
         index: str,
         query_string: str = "*",
-        from_ts: str = None,
-        to_ts: str = None,
+        from_ts: str | None = None,
+        to_ts: str | None = None,
         ts_field: str = "@timestamp",
         limit: int = 50,
         offset: int = 0,
-        sort_field: str = None,
+        sort_field: str | None = None,
         sort_dir: str = "desc",
-        source_fields: list = None,
+        source_fields: list | None = None,
     ) -> dict:
-        """Search with a Lucene query string. Returns {"total": N, "hits": [...]}.
+        """Search with a Lucene query string.
+
+        Returns {"total": N, "ids": [...], "hits": [...]}. `ids[i]` is the
+        OpenSearch `_id` of `hits[i]` — the two lists are index-aligned and always
+        the same length. `_id` is deliberately NOT merged into each hit dict: a
+        document's own `_source` may contain a field literally called `_id`, and
+        merging would silently overwrite one with the other. This is the only way
+        to obtain the doc_id that `explain` requires.
 
         Use offset for pagination: offset=200 fetches the next page after the first 200.
         Adds a "warning" key when limit is capped or no time range is given.
         """
-        capped = min(limit, self.max_search_limit)
+        capped = max(min(limit, self.max_search_limit), 0)
         q = self._qs_query(query_string, from_ts, to_ts, ts_field)
+        sort_on = sort_field or ts_field
         body = {
             "query": q,
             "size": capped,
             "from": max(offset, 0),
-            "sort": [{(sort_field or ts_field): {"order": sort_dir}}],
+            # unmapped_type makes the sort degrade instead of 400ing on an index
+            # that lacks the field — a wildcard where only some indices carry
+            # @timestamp, or an index with no timestamp field at all. Without it
+            # the documented "use discover_fields when get_mapping is blocked"
+            # fallback is circular, because discover_fields sorts too.
+            "sort": [{
+                sort_on: {
+                    "order": sort_dir,
+                    "unmapped_type": "date" if sort_on == ts_field else "keyword",
+                }
+            }],
         }
         if source_fields:
             body["_source"] = source_fields
         result = self._post(f"/{index}/_search", body=body)
-        hits = result.get("hits", {})
-        total = hits.get("total", {})
+        hits = _dig(result, "hits")
+        total = _val(hits, "total", 0)
         if isinstance(total, dict):
-            total = total.get("value", 0)
+            total = _val(total, "value", 0)
+        elif not isinstance(total, (int, float)):
+            total = 0
         warnings = []
         if capped < limit:
             warnings.append(
@@ -500,10 +787,12 @@ class OpenSearchClient:
             )
         if not from_ts and not to_ts:
             warnings.append(_NO_TIME_RANGE_WARNING)
+        raw_hits = _items(hits, "hits")
         out = {"total": total}
         if warnings:
             out["warning"] = " | ".join(warnings)
-        out["hits"] = [h.get("_source", {}) for h in hits.get("hits", [])]
+        out["ids"] = [h.get("_id") if isinstance(h, dict) else None for h in raw_hits]
+        out["hits"] = [_dig(h, "_source") for h in raw_hits]
         return out
 
     def timeline(
@@ -511,12 +800,12 @@ class OpenSearchClient:
         index: str,
         entity: str,
         fields: list,
-        from_ts: str = None,
-        to_ts: str = None,
+        from_ts: str | None = None,
+        to_ts: str | None = None,
         ts_field: str = "@timestamp",
         limit: int = 100,
-        source_fields: list = None,
-        extra_query: str = None,
+        source_fields: list | None = None,
+        extra_query: str | None = None,
     ) -> dict:
         """Chronological event timeline for one entity across multiple fields.
 
@@ -525,7 +814,13 @@ class OpenSearchClient:
         """
         if not fields:
             raise ValueError("fields must be a non-empty list of field names to match the entity against.")
-        escaped = str(entity).replace('"', '\\"')
+        # Backslash first, then the quote: inside a Lucene phrase the backslash is
+        # itself the escape character, so a Windows path ("C:\Windows\System32")
+        # or a DOMAIN\user value is corrupted — \W and \S are consumed as escapes
+        # and the phrase stops matching the document it came from — and a trailing
+        # backslash escapes the closing quote, producing an unparseable query.
+        # Escaping the quote first would double-escape the backslashes it added.
+        escaped = str(entity).replace("\\", "\\\\").replace('"', '\\"')
         clauses = " OR ".join(f'{f}:"{escaped}"' for f in fields)
         qs = f"({clauses})"
         if extra_query:
@@ -555,8 +850,8 @@ class OpenSearchClient:
         self,
         index: str,
         query_string: str = "*",
-        from_ts: str = None,
-        to_ts: str = None,
+        from_ts: str | None = None,
+        to_ts: str | None = None,
         ts_field: str = "@timestamp",
     ) -> dict:
         """Count documents matching a query. Returns {"count": N}.
@@ -565,7 +860,7 @@ class OpenSearchClient:
         """
         q = self._qs_query(query_string, from_ts, to_ts, ts_field)
         result = self._post(f"/{index}/_count", body={"query": q})
-        out = {"count": result.get("count", 0)}
+        out = {"count": _val(result, "count", 0)}
         if not from_ts and not to_ts:
             out["warning"] = _NO_TIME_RANGE_WARNING
         return out
@@ -575,100 +870,305 @@ class OpenSearchClient:
         index: str,
         field: str,
         query_string: str = "*",
-        from_ts: str = None,
-        to_ts: str = None,
+        from_ts: str | None = None,
+        to_ts: str | None = None,
         ts_field: str = "@timestamp",
         size: int = 50,
     ) -> dict:
         """Top N values of a field. Returns {value: count} sorted descending.
 
-        Adds a "warning" key when the field may be a text field (no .keyword suffix),
-        which triggers fielddata and loads heap memory on the cluster.
+        `size` is capped at self.max_terms_size (default MAX_TERMS_SIZE, override
+        with OPENSEARCH_MAX_TERMS_SIZE): a high-cardinality terms aggregation is
+        the cheapest way for a caller to exhaust a coordinating node's heap.
+
+        Adds a "_warning" key when the size is capped and/or the field may be a
+        text field (no .keyword suffix), which triggers fielddata and loads heap
+        memory on the cluster. Multiple messages are joined with " | ".
         """
         q = self._qs_query(query_string, from_ts, to_ts, ts_field)
+        capped = self._cap_terms_size(size)
         body = {
             "size": 0,
             "query": q,
-            "aggs": {"top_values": {"terms": {"field": field, "size": size}}},
+            "aggs": {"top_values": {"terms": {"field": field, "size": capped}}},
         }
         result = self._post(f"/{index}/_search", body=body)
-        buckets = result.get("aggregations", {}).get("top_values", {}).get("buckets", [])
+        buckets = _items(_dig(result, "aggregations", "top_values"), "buckets")
         out = {b["key"]: b["doc_count"] for b in buckets}
+        warnings = []
+        if capped != size:
+            warnings.append(self._terms_size_warning(size, capped))
         if _is_likely_text_field(field):
-            out["_warning"] = (
+            warnings.append(
                 f"Field '{field}' looks like a text field. If results look wrong, "
                 f"try '{field}.keyword' instead. Using text fields in aggregations "
                 "loads fielddata into heap memory."
             )
+        if warnings:
+            out["_warning"] = " | ".join(warnings)
         return out
+
+    # ── Aggregation caps ──────────────────────────────────────
+
+    def _cap_terms_size(self, size) -> int:
+        """Clamp a requested terms `size` into [1, self.max_terms_size]."""
+        try:
+            requested = int(size)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"size must be an integer. Got: {size!r}") from exc
+        return max(min(requested, self.max_terms_size), 1)
+
+    def _terms_size_warning(self, requested, capped: int) -> str:
+        return (
+            f"size capped at {capped:,} (requested {requested}). Maximum is "
+            f"{self.max_terms_size:,} (OPENSEARCH_MAX_TERMS_SIZE). A terms "
+            "aggregation over very high cardinality loads the whole bucket set "
+            "into cluster heap; narrow the query or the time range instead."
+        )
+
+    def _cap_result_size(self, size) -> tuple[int, str | None]:
+        """Clamp a requested result-set `size` into [1, self.max_search_limit].
+
+        Used by the Alerting and Anomaly Detection reads, which return whole
+        records rather than aggregation buckets and so share the search limit
+        rather than the terms limit.
+
+        Returns (capped, warning). The warning is None when nothing was clamped —
+        silently returning fewer records than asked for is how an agent concludes
+        "that is all there is" and stops looking, so the caller must surface it.
+        """
+        try:
+            requested = int(size)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"size must be an integer. Got: {size!r}") from exc
+        capped = max(min(requested, self.max_search_limit), 1)
+        if capped == requested:
+            return capped, None
+        return capped, (
+            f"size capped at {capped:,} (requested {requested}). Maximum is "
+            f"{self.max_search_limit:,} (OPENSEARCH_MAX_SEARCH_LIMIT). "
+            "Results may be incomplete — narrow the filter, or page by "
+            "restricting to one monitor or detector at a time."
+        )
 
     def multi_terms(
         self,
         index: str,
         aggregations: list,
         query_string: str = "*",
-        from_ts: str = None,
-        to_ts: str = None,
+        from_ts: str | None = None,
+        to_ts: str | None = None,
         ts_field: str = "@timestamp",
     ) -> dict:
         """Multiple field frequency analyses in one call.
 
+        Pre-conditions: `aggregations` is a non-empty list of dicts, each with a
+        non-empty string "id" and "field" and an optional positive integer "size".
+        Ids must be unique — two specs sharing an id used to collapse into a
+        single aggregation, so the caller silently received fewer answers than
+        questions asked, with no way to tell which field the numbers came from.
+        Every violation raises ValueError naming the offending entry, before any
+        request is issued.
+
         aggregations: [{"id": "...", "field": "...", "size": N}, ...]
         Returns {id: {value: count}}.
-        Adds "_warnings" key listing any fields that may cause fielddata heap pressure.
+        Adds a "_warning" key listing any capping that happened and any fields
+        that may cause fielddata heap pressure, joined with " | ".
         """
-        if not aggregations:
-            raise ValueError("aggregations list must not be empty.")
+        specs, warnings = self._validate_aggregations(aggregations)
         q = self._qs_query(query_string, from_ts, to_ts, ts_field)
         aggs = {
-            a["id"]: {"terms": {"field": a["field"], "size": a.get("size", 50)}}
-            for a in aggregations
+            a["id"]: {"terms": {"field": a["field"], "size": a["size"]}}
+            for a in specs
         }
         result = self._post(f"/{index}/_search", body={"size": 0, "query": q, "aggs": aggs})
         out = {}
-        for a in aggregations:
-            buckets = (
-                result.get("aggregations", {}).get(a["id"], {}).get("buckets", [])
-            )
+        for a in specs:
+            buckets = _items(_dig(result, "aggregations", a["id"]), "buckets")
             out[a["id"]] = {b["key"]: b["doc_count"] for b in buckets}
-        text_fields = [a["field"] for a in aggregations if _is_likely_text_field(a["field"])]
-        if text_fields:
-            out["_warning"] = " | ".join(
-                f"Field '{f}' looks like a text field — try '{f}.keyword' to avoid fielddata heap pressure."
-                for f in text_fields
-            )
+        warnings.extend(
+            f"Field '{a['field']}' looks like a text field — "
+            f"try '{a['field']}.keyword' to avoid fielddata heap pressure."
+            for a in specs
+            if _is_likely_text_field(a["field"])
+        )
+        if warnings:
+            out["_warning"] = " | ".join(warnings)
         return out
+
+    def _validate_aggregations(self, aggregations) -> tuple:
+        """Validate and normalise multi_terms specs. Returns (specs, warnings).
+
+        Post-condition: every returned spec has a unique non-empty "id", a
+        non-empty "field" and an integer "size" within the terms-size cap.
+        """
+        if not aggregations:
+            raise ValueError("aggregations list must not be empty.")
+        if not isinstance(aggregations, list):
+            raise ValueError(
+                "aggregations must be a list of dicts, each with an 'id' and a "
+                f"'field'. Got: {type(aggregations).__name__}."
+            )
+        warnings = []
+        kept = aggregations
+        if len(aggregations) > self.max_aggregations:
+            kept = aggregations[: self.max_aggregations]
+            dropped = [
+                str(a.get("id")) if isinstance(a, dict) else repr(a)
+                for a in aggregations[self.max_aggregations:]
+            ]
+            warnings.append(
+                f"Only the first {self.max_aggregations} aggregations were run "
+                f"(requested {len(aggregations)}). Maximum is "
+                f"{self.max_aggregations} (OPENSEARCH_MAX_AGGREGATIONS). Not "
+                f"requested, no results returned for: {', '.join(dropped)}. "
+                "Split them across several calls."
+            )
+        specs, seen = [], set()
+        for position, spec in enumerate(kept):
+            if not isinstance(spec, dict):
+                raise ValueError(
+                    f"aggregations[{position}] must be a dict with 'id' and "
+                    f"'field' keys. Got: {spec!r}"
+                )
+            for key in ("id", "field"):
+                value = spec.get(key)
+                if not value or not isinstance(value, str):
+                    raise ValueError(
+                        f"aggregations[{position}] is missing a non-empty string "
+                        f"'{key}'. Each entry needs both, e.g. "
+                        '{"id": "agents", "field": "agent.name", "size": 20}. '
+                        f"Got: {spec!r}"
+                    )
+            if spec["id"] in seen:
+                raise ValueError(
+                    f"Duplicate aggregation id {spec['id']!r} at aggregations"
+                    f"[{position}]. Ids label the results, so they must be "
+                    "unique — otherwise two aggregations collapse into one and "
+                    "you cannot tell which field the counts belong to."
+                )
+            seen.add(spec["id"])
+            capped = self._cap_terms_size(spec.get("size", 50))
+            if capped != spec.get("size", 50):
+                warnings.append(f"[{spec['id']}] {self._terms_size_warning(spec.get('size'), capped)}")
+            specs.append({"id": spec["id"], "field": spec["field"], "size": capped})
+        return specs, warnings
 
     @staticmethod
     def _parse_ts(ts: str) -> float:
-        """Parse an ISO 8601 UTC timestamp to a Unix epoch float."""
-        ts = ts.rstrip("Z")
-        for fmt in ("%Y-%m-%dT%H:%M:%S.%f", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d"):
-            try:
-                return datetime.strptime(ts, fmt).replace(tzinfo=timezone.utc).timestamp()
-            except ValueError:
-                continue
-        raise ValueError(f"Cannot parse timestamp: {ts!r}")
+        """Parse a UTC ISO-8601 timestamp to a Unix epoch float.
 
-    def _check_histogram_buckets(self, from_ts: str, to_ts: str, interval: str):
-        """Raise ValueError if the expected bucket count exceeds the safe limit."""
-        if interval == "auto":
-            return  # auto delegates to OpenSearch with a fixed cap of 50
-        m = _INTERVAL_RE.match(interval)
+        Accepts everything OpenSearch's strict_date_optional_time accepts and
+        everything `datetime.isoformat()` emits, so a timestamp is portable
+        between this guard and the tools that forward strings to the cluster
+        untouched: date only, "HH:MM" or "HH:MM:SS" precision, any number of
+        fractional digits (truncated to microseconds), a "Z"/"z" suffix, and
+        numeric offsets written "+HH:MM", "+HHMM" or "+HH".
+
+        A timestamp carrying no zone is treated as UTC, which is the documented
+        contract of every ts parameter in this server.
+
+        Pre-condition: `ts` is a non-empty string.
+        Raises:
+            ValueError: for a non-string, an empty string, or anything the ISO
+                grammar does not cover. This is the only exception type that may
+                escape — callers translate ValueError into an actionable message,
+                so a TypeError or AttributeError would bypass that layer.
+        """
+        if not isinstance(ts, str) or not ts.strip():
+            raise ValueError(f"Cannot parse timestamp: {ts!r}")
+        s = ts.strip()
+        if " " in s:
+            raise ValueError(
+                f"Cannot parse timestamp: {ts!r}. Use the ISO 8601 'T' separator, "
+                "e.g. '2026-06-23T00:00:00Z' — a space is not accepted by "
+                "OpenSearch either."
+            )
+        # Suffix removal, not character-set stripping: "...ZZZ" is malformed and
+        # must be rejected rather than silently read as a single Z.
+        if s[-1] in ("Z", "z"):
+            s = s[:-1] + "+00:00"
+        head, sep, tail = s.partition("T")
+        if sep:
+            tail = _TS_FRACTION_RE.sub(
+                lambda m: "." + m.group(1)[:6].ljust(6, "0"), tail, count=1
+            )
+            tail = _TS_OFFSET_NO_COLON_RE.sub(r"\1\2:\3", tail)
+            tail = _TS_OFFSET_HOURS_ONLY_RE.sub(r"\1\2:00", tail)
+            s = f"{head}T{tail}"
+        try:
+            parsed = datetime.fromisoformat(s)
+        except ValueError as exc:
+            raise ValueError(f"Cannot parse timestamp: {ts!r}") from exc
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.timestamp()
+
+    @staticmethod
+    def _parse_interval(interval: str) -> tuple:
+        """Validate an interval string. Returns (magnitude, unit).
+
+        Post-condition: the returned pair is dispatchable — the magnitude is >= 1
+        and the unit/magnitude combination is one OpenSearch will accept in the
+        date_histogram key that _interval_agg_key() picks for it.
+        """
+        m = _INTERVAL_RE.match(interval or "")
         if not m:
             raise ValueError(
                 f"Invalid interval {interval!r}. "
                 "Use a number + unit, e.g. '15m', '1h', '1d'. "
                 "Valid units: s m h d w M y. Or use 'auto'."
             )
-        interval_secs = int(m.group(1)) * _INTERVAL_SECONDS[m.group(2)]
+        magnitude, unit = int(m.group(1)), m.group(2)
+        if magnitude < 1:
+            raise ValueError(
+                f"Invalid interval {interval!r}: the magnitude must be at least 1. "
+                "Use e.g. '1m' for one-minute buckets, or 'auto'."
+            )
+        if unit in _CALENDAR_UNITS and magnitude != 1:
+            raise ValueError(
+                f"Invalid interval {interval!r}: w, M and y are calendar units, and "
+                f"OpenSearch accepts a calendar interval only with a multiplier of 1. "
+                f"Use '1{unit}', or express the span with a fixed unit (s m h d) — "
+                "e.g. '14d' instead of '2w'."
+            )
+        return magnitude, unit
+
+    @staticmethod
+    def _interval_agg_key(unit: str) -> str:
+        """The date_histogram key a unit belongs in.
+
+        w/M/y are calendar-only: putting them in `fixed_interval` — which accepts
+        only ms/s/m/h/d — makes the cluster answer 400, which _raise_for_status
+        then renders as the misleading "check your query syntax or field names".
+        """
+        return "calendar_interval" if unit in _CALENDAR_UNITS else "fixed_interval"
+
+    def _check_histogram_buckets(self, from_ts: str, to_ts: str, interval: str):
+        """Validate the interval and bounds; reject bucket-count explosions.
+
+        Post-condition: returns None only when the request is dispatchable — a
+        valid interval, two parseable bounds in chronological order, and an
+        expected bucket count within self.max_histogram_buckets. Every other
+        outcome raises ValueError, and ValueError alone: callers guard on it to
+        turn the failure into an actionable message.
+        """
+        if interval == "auto":
+            return  # auto delegates to OpenSearch with a fixed cap of 50
+        magnitude, unit = self._parse_interval(interval)
         try:
             t0 = self._parse_ts(from_ts)
             t1 = self._parse_ts(to_ts)
         except ValueError as e:
             raise ValueError(f"Cannot compute bucket count: {e}") from e
-        range_secs = max(t1 - t0, 0)
-        expected = int(range_secs / interval_secs) + 1
+        if t1 < t0:
+            raise ValueError(
+                f"Reversed time range: from_ts ({from_ts}) is after to_ts ({to_ts}). "
+                "Swap the bounds — a reversed range matches no documents, so the "
+                "histogram would be empty rather than wrong-looking."
+            )
+        interval_secs = magnitude * _INTERVAL_SECONDS[unit]
+        expected = int((t1 - t0) / interval_secs) + 1
         if expected > self.max_histogram_buckets:
             raise ValueError(
                 f"Too many buckets: ~{expected:,} expected "
@@ -686,16 +1186,22 @@ class OpenSearchClient:
         interval: str = "1h",
         query_string: str = "*",
     ) -> dict:
-        """Temporal histogram. Returns {"results": {timestamp: count}}."""
+        """Temporal histogram. Returns {"interval_used": str, "results": {timestamp: count}}.
+
+        Calendar units (w, M, y) are routed to `calendar_interval` and everything
+        else to `fixed_interval`, because OpenSearch accepts each unit in exactly
+        one of the two.
+        """
         self._check_histogram_buckets(from_ts, to_ts, interval)
         q = self._qs_query(query_string, from_ts, to_ts, ts_field)
         if interval == "auto":
             agg_spec = {"auto_date_histogram": {"field": ts_field, "buckets": 50}}
         else:
+            _, unit = self._parse_interval(interval)
             agg_spec = {
                 "date_histogram": {
                     "field": ts_field,
-                    "fixed_interval": interval,
+                    self._interval_agg_key(unit): interval,
                     "min_doc_count": 0,
                     "extended_bounds": {"min": from_ts, "max": to_ts},
                 }
@@ -704,30 +1210,39 @@ class OpenSearchClient:
             f"/{index}/_search",
             body={"size": 0, "query": q, "aggs": {"over_time": agg_spec}},
         )
-        agg_result = result.get("aggregations", {}).get("over_time", {})
-        buckets = agg_result.get("buckets", [])
+        agg_result = _dig(result, "aggregations", "over_time")
+        buckets = _items(agg_result, "buckets")
         # Resolve the actual interval used (relevant when interval="auto")
         interval_used = interval
         if interval == "auto" and buckets:
-            interval_used = agg_result.get("interval", "auto")
-        return {
-            "interval_used": interval_used,
-            "results": {
-                b.get("key_as_string", str(b["key"])): b["doc_count"]
-                for b in buckets
-            },
-        }
+            interval_used = _val(agg_result, "interval", "auto")
+        results = {}
+        for b in buckets:
+            label = _bucket_label(b)
+            if label is not None:
+                results[label] = b.get("doc_count")
+        return {"interval_used": interval_used, "results": results}
 
     def stats(
         self,
         index: str,
         field: str,
         query_string: str = "*",
-        from_ts: str = None,
-        to_ts: str = None,
+        from_ts: str | None = None,
+        to_ts: str | None = None,
         ts_field: str = "@timestamp",
     ) -> dict:
-        """Numeric stats (count, min, max, avg, sum, std_deviation) for a field."""
+        """Numeric stats (count, min, max, avg, sum, std_deviation) for a field.
+
+        Post-condition: "count" is always an integer. The other five are the
+        numbers OpenSearch computed, or **None when there was nothing to compute**
+        — extended_stats over zero matching documents returns min/max/avg/
+        std_deviation as JSON null, and null is reported as null rather than
+        coerced to 0. Coercing would be a silent wrong answer: an agent could not
+        distinguish "no documents matched" from "the minimum really was zero".
+        Callers must therefore check for None before doing arithmetic; count == 0
+        is the reliable signal that the other metrics carry no information.
+        """
         q = self._qs_query(query_string, from_ts, to_ts, ts_field)
         body = {
             "size": 0,
@@ -744,48 +1259,29 @@ class OpenSearchClient:
                     f"Original error: {exc}"
                 ) from None
             raise
-        st = result.get("aggregations", {}).get("field_stats", {})
+        st = _dig(result, "aggregations", "field_stats")
         return {
-            "count": st.get("count", 0),
-            "min": st.get("min", 0),
-            "max": st.get("max", 0),
-            "avg": st.get("avg", 0),
-            "sum": st.get("sum", 0),
-            "std_deviation": st.get("std_deviation", 0),
+            "count": _val(st, "count", 0),
+            "min": st.get("min"),
+            "max": st.get("max"),
+            "avg": st.get("avg"),
+            "sum": st.get("sum"),
+            "std_deviation": st.get("std_deviation"),
         }
 
-    # ── Bypass methods (caller owns path validation) ──────────
+    # ── Escape hatch (still allowlisted) ──────────────────────
 
-    def raw_get(self, path: str, params: dict = None) -> dict:
-        """GET any path, bypassing the read-only allowlist. Caller owns validation."""
-        self._resolve_backend()
-        if self.backend == BACKEND_DASHBOARDS:
-            return self._dashboards_proxy("GET", path, params=params)
-        r = self._session.get(
-            f"{self.opensearch_url}{path}",
-            params=params,
-            verify=self.verify_ssl,
-            timeout=self.timeout,
-        )
-        self._raise_for_status(r, f"GET {path}")
-        self.last_query_ms = int(r.elapsed.total_seconds() * 1000)
-        return r.json()
+    def api_get(self, path: str, params: dict | None = None):
+        """GET a read-only endpoint that has no dedicated method here.
 
-    def raw_post(self, path: str, body: dict = None, params: dict = None) -> dict:
-        """POST any path, bypassing the read-only allowlist. Caller owns validation."""
-        self._resolve_backend()
-        if self.backend == BACKEND_DASHBOARDS:
-            return self._dashboards_proxy("POST", path, body=body, params=params)
-        r = self._session.post(
-            f"{self.opensearch_url}{path}",
-            json=body,
-            params=params,
-            verify=self.verify_ssl,
-            timeout=self.timeout,
-        )
-        self._raise_for_status(r, f"POST {path}")
-        self.last_query_ms = int(r.elapsed.total_seconds() * 1000)
-        return r.json()
+        Pre-condition: `path` is an absolute path on the GET read-only
+        allowlist. Anything else raises PermissionError (or ValueError when the
+        path is not absolute) — see _check_path.
+
+        Returns the decoded JSON exactly as the cluster sent it, so callers must
+        cope with both objects and arrays: the _cat/* APIs return arrays.
+        """
+        return self._get(path, params=params)
 
     def ppl(self, query: str) -> dict:
         """Execute a PPL (Piped Processing Language) query."""
@@ -794,23 +1290,40 @@ class OpenSearchClient:
         return self._post("/_plugins/_ppl", body={"query": query})
 
     def index_settings(self, index: str) -> dict:
-        """Fetch index settings. Returns a simplified summary per index."""
+        """Fetch index settings. Returns a simplified summary per index.
+
+        Every lookup treats a present-but-null value as absent: an index whose ISM
+        policy has been detached carries `"lifecycle": null`, which used to raise
+        AttributeError and kill the whole call, and a null refresh_interval used to
+        defeat the documented "1s" default instead of applying it.
+        """
         raw = self._get(f"/{index}/_settings")
         out = {}
-        for idx_name, cfg in raw.items():
-            s = cfg.get("settings", {}).get("index", {})
+        for idx_name, cfg in _dig(raw).items():
+            s = _dig(cfg, "settings", "index")
             out[idx_name] = {
                 "number_of_shards": s.get("number_of_shards"),
                 "number_of_replicas": s.get("number_of_replicas"),
-                "refresh_interval": s.get("refresh_interval", "1s"),
-                "lifecycle_name": s.get("lifecycle", {}).get("name"),
+                "refresh_interval": _val(s, "refresh_interval", "1s"),
+                "lifecycle_name": _val(_dig(s, "lifecycle"), "name"),
                 "creation_date_ms": s.get("creation_date"),
             }
         return out
 
     def explain(self, index: str, doc_id: str, query: dict) -> dict:
-        """Explain why a document matches or doesn't match a query."""
-        return self.raw_post(f"/{index}/_explain/{doc_id}", body={"query": query})
+        """Explain why a document matches or doesn't match a query.
+
+        Pre-conditions: `index` is a single exact index name and `doc_id` a
+        single document id — neither may be empty or contain "/", since both are
+        interpolated into the request path. This is the only place that path is
+        built; _check_path then decides whether it may be issued.
+        """
+        for name, value in (("index", index), ("doc_id", doc_id)):
+            if not value or not isinstance(value, str) or "/" in value:
+                raise ValueError(
+                    f"{name} must be a non-empty string without '/'. Got: {value!r}"
+                )
+        return self._post(f"/{index}/_explain/{doc_id}", body={"query": query})
 
     # ── Alerting plugin (read-only) ───────────────────────────
 
@@ -823,8 +1336,9 @@ class OpenSearchClient:
         body = {"size": size, "query": {"match_all": {}}}
         result = self._post("/_plugins/_alerting/monitors/_search", body=body)
         out = []
-        for hit in result.get("hits", {}).get("hits", []):
-            mon = hit.get("_source", {}).get("monitor", hit.get("_source", {}))
+        for hit in _items(_dig(result, "hits"), "hits"):
+            src = _dig(hit, "_source")
+            mon = _dig(src, "monitor") or src
             out.append({
                 "id": hit.get("_id"),
                 "name": mon.get("name"),
@@ -836,17 +1350,21 @@ class OpenSearchClient:
 
     def get_alerts(
         self,
-        state: str = None,
-        monitor_id: str = None,
+        state: str | None = None,
+        monitor_id: str | None = None,
         size: int = 50,
     ) -> dict:
         """Fetch alerts raised by Alerting-plugin monitors.
 
         state: filter by alert state, e.g. "ACTIVE", "ACKNOWLEDGED", "COMPLETED".
         monitor_id: restrict to a single monitor.
+        size: capped at self.max_search_limit (default MAX_SEARCH_LIMIT, override
+              with OPENSEARCH_MAX_SEARCH_LIMIT); a "warning" key says so when it
+              is capped.
         Requires the Alerting plugin. Returns 403/404 if unavailable.
         """
-        params = {"size": size, "sortField": "start_time", "sortOrder": "desc"}
+        capped, size_warning = self._cap_result_size(size)
+        params = {"size": capped, "sortField": "start_time", "sortOrder": "desc"}
         if state:
             params["alertState"] = state
         if monitor_id:
@@ -865,7 +1383,11 @@ class OpenSearchClient:
             }
             for a in result.get("alerts", [])
         ]
-        return {"total": result.get("totalAlerts", len(alerts)), "alerts": alerts}
+        out = {"total": result.get("totalAlerts", len(alerts))}
+        if size_warning:
+            out["warning"] = size_warning
+        out["alerts"] = alerts
+        return out
 
     # ── Anomaly Detection plugin (read-only) ──────────────────
 
@@ -891,9 +1413,9 @@ class OpenSearchClient:
 
     def get_anomaly_results(
         self,
-        detector_id: str = None,
-        from_ts: str = None,
-        to_ts: str = None,
+        detector_id: str | None = None,
+        from_ts: str | None = None,
+        to_ts: str | None = None,
         min_grade: float = 0.0,
         size: int = 50,
     ) -> dict:
@@ -902,9 +1424,14 @@ class OpenSearchClient:
         detector_id: restrict to a single detector.
         min_grade: only return results with anomaly_grade >= this (0-1); default 0
                    returns anomalies only (grade > 0 is filtered when min_grade > 0).
-        from_ts/to_ts: filter on data_end_time (UTC ISO 8601).
+        from_ts/to_ts: filter on data_end_time (UTC ISO 8601). Omitting both scans
+                   the detector's whole result history; a "warning" key says so.
+        size: capped at self.max_search_limit (default MAX_SEARCH_LIMIT, override
+                   with OPENSEARCH_MAX_SEARCH_LIMIT); a "warning" key says so when
+                   it is capped.
         Requires the Anomaly Detection plugin. Returns 403/404 if unavailable.
         """
+        capped, size_warning = self._cap_result_size(size)
         filters = []
         if detector_id:
             filters.append({"term": {"detector_id": detector_id}})
@@ -920,28 +1447,35 @@ class OpenSearchClient:
                 rng["lte"] = to_ts
             filters.append({"range": {"data_end_time": {**rng, "format": "strict_date_optional_time"}}})
         body = {
-            "size": size,
+            "size": capped,
             "query": {"bool": {"filter": filters}},
             "sort": [{"anomaly_grade": {"order": "desc"}}],
         }
         result = self._post(
             "/_plugins/_anomaly_detection/detectors/results/_search", body=body
         )
-        hits = result.get("hits", {})
-        total = hits.get("total", {})
+        hits = _dig(result, "hits")
+        total = _val(hits, "total", 0)
         if isinstance(total, dict):
-            total = total.get("value", 0)
+            total = _val(total, "value", 0)
         anomalies = [
             {
-                "detector_id": h.get("_source", {}).get("detector_id"),
-                "anomaly_grade": h.get("_source", {}).get("anomaly_grade"),
-                "confidence": h.get("_source", {}).get("confidence"),
-                "data_start_time": h.get("_source", {}).get("data_start_time"),
-                "data_end_time": h.get("_source", {}).get("data_end_time"),
+                "detector_id": _val(_dig(h, "_source"), "detector_id"),
+                "anomaly_grade": _val(_dig(h, "_source"), "anomaly_grade"),
+                "confidence": _val(_dig(h, "_source"), "confidence"),
+                "data_start_time": _val(_dig(h, "_source"), "data_start_time"),
+                "data_end_time": _val(_dig(h, "_source"), "data_end_time"),
             }
-            for h in hits.get("hits", [])
+            for h in _items(hits, "hits")
         ]
-        return {"total": total, "anomalies": anomalies}
+        warnings = [w for w in (size_warning,) if w]
+        if not from_ts and not to_ts:
+            warnings.append(_NO_TIME_RANGE_WARNING)
+        out = {"total": total}
+        if warnings:
+            out["warning"] = " | ".join(warnings)
+        out["anomalies"] = anomalies
+        return out
 
 
 # ── Config loading ────────────────────────────────────────────────────────────
@@ -975,15 +1509,22 @@ def _coerce_bool(value, default=True) -> bool:
 def init_client() -> OpenSearchClient:
     """Initialise OpenSearchClient from env vars or config file.
 
-    Env vars (priority over config file):
-        OPENSEARCH_DASHBOARDS_URL       — e.g. https://opensearch.example.com
-        OPENSEARCH_URL                  — e.g. https://opensearch.example.com:9200 (fallback)
+    Env vars (priority over config file). This list is the complete set the code
+    reads — keep it that way; an undocumented knob is one nobody can turn:
+        OPENSEARCH_DASHBOARDS_URL        — e.g. https://opensearch.example.com
+        OPENSEARCH_URL                   — e.g. https://opensearch.example.com:9200 (fallback)
         OPENSEARCH_USERNAME
         OPENSEARCH_PASSWORD
-        OPENSEARCH_VERIFY_SSL           — "true"/"false" (default: true)
-        OPENSEARCH_TIMEOUT              — seconds (default: 60)
-        OPENSEARCH_MAX_SEARCH_LIMIT     — hard cap on search results (default: 200)
-        OPENSEARCH_MAX_HISTOGRAM_BUCKETS — hard cap on histogram buckets (default: 2000)
+        OPENSEARCH_VERIFY_SSL            — "true"/"false" (default: true). Only the
+                                           exact string "false" disables it.
+        OPENSEARCH_TIMEOUT               — seconds per request (default: 60)
+        OPENSEARCH_MAX_SEARCH_LIMIT      — default cap on search results (default: 200)
+        OPENSEARCH_MAX_HISTOGRAM_BUCKETS — default cap on histogram buckets (default: 2000)
+        OPENSEARCH_MAX_TERMS_SIZE        — default cap on a terms agg size (default: 1000)
+        OPENSEARCH_MAX_AGGREGATIONS      — default cap on multi_terms agg count (default: 20)
+        OPENSEARCH_ALLOW_INSECURE_CONFIG — "true" downgrades the 0600 permission
+                                           check on config.json from a hard
+                                           PermissionError to a logged warning
     """
     try:
         from dotenv import load_dotenv
@@ -1016,6 +1557,12 @@ def init_client() -> OpenSearchClient:
     max_histogram_buckets = int(
         os.environ.get("OPENSEARCH_MAX_HISTOGRAM_BUCKETS", config.get("max_histogram_buckets", MAX_HISTOGRAM_BUCKETS))
     )
+    max_terms_size = int(
+        os.environ.get("OPENSEARCH_MAX_TERMS_SIZE", config.get("max_terms_size", MAX_TERMS_SIZE))
+    )
+    max_aggregations = int(
+        os.environ.get("OPENSEARCH_MAX_AGGREGATIONS", config.get("max_aggregations", MAX_AGGREGATIONS))
+    )
 
     client = OpenSearchClient(
         dashboards_url=dashboards_url,
@@ -1026,6 +1573,8 @@ def init_client() -> OpenSearchClient:
         timeout=timeout,
         max_search_limit=max_search_limit,
         max_histogram_buckets=max_histogram_buckets,
+        max_terms_size=max_terms_size,
+        max_aggregations=max_aggregations,
     )
     # Warm the connection at startup so the first tool call doesn't pay the
     # backend probe cost (~1.3s). Also surfaces config errors immediately.
