@@ -17,6 +17,7 @@ supports an architectural characteristic, the decision is architectural.
 | [0002](0002-dashboards-proxy-first-with-direct-fallback.md) | Dashboards proxy first, direct OpenSearch as fallback | Accepted |
 | [0003](0003-single-source-of-truth-for-version.md) | Single source of truth for the version string | Accepted |
 | [0004](0004-single-allowlist-as-the-read-only-enforcement-point.md) | A single allowlist is the only read-only enforcement point | Accepted — exclusion list pending maintainer review |
+| [0005](0005-distribute-as-a-single-import-package.md) | Distribute as a single import package | Proposed — breaking change to the published import surface |
 
 ## Conventions
 

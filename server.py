@@ -40,12 +40,21 @@ Credentials (env vars or ~/.config/mcp-opensearch/config.json):
 """
 
 import logging
+import os
+import threading
 
 from fastmcp import FastMCP
 
 from lib.client import init_client
+from lib.compare import compare_windows
 
-logging.basicConfig(level=logging.WARNING)
+# Configure only this server's logger, never the root logger. basicConfig() on
+# the root at import time silenced lib.client's INFO lines — including the only
+# two that say which backend was selected — which left an operator debugging a
+# backend problem with no log and no latency data. Level is settable so that
+# debugging does not require editing the source.
+_LOG_LEVEL = os.environ.get("OPENSEARCH_LOG_LEVEL", "WARNING").upper()
+logging.basicConfig(level=getattr(logging, _LOG_LEVEL, logging.WARNING))
 logger = logging.getLogger("opensearch-mcp")
 
 mcp = FastMCP("opensearch")
@@ -56,12 +65,24 @@ mcp = FastMCP("opensearch")
 # allowed paths in the message. Tools here stay thin delegates.
 
 _client = None
+_client_lock = threading.Lock()
 
 
 def get_client():
+    """The shared client, built once.
+
+    FastMCP dispatches synchronous tool functions on a worker thread pool, so the
+    plain `if _client is None` check-then-assign was a race: two concurrent first
+    calls both saw None, both paid the backend probe, and one of the two
+    `requests.Session` objects was silently orphaned. Double-checked locking keeps
+    the fast path lock-free after initialisation while making the first call
+    exactly-once.
+    """
     global _client
     if _client is None:
-        _client = init_client()
+        with _client_lock:
+            if _client is None:          # re-check: another thread may have won
+                _client = init_client()
     return _client
 
 
@@ -531,14 +552,17 @@ def opensearch_explain(
 ) -> dict:
     """Explain why a specific document matches (or doesn't match) a query.
 
-    Use after opensearch_search returns unexpected results and you have a known
-    document ID. Get the doc ID from a prior search by including "_id" in
-    source_fields (note: _id is a metadata field — use opensearch_search and
-    read the _id from hits). Exact index name only — no wildcards.
+    Use after opensearch_search returns unexpected results and you have a document
+    ID. Take doc_id from the "ids" list that opensearch_search and
+    opensearch_timeline return: ids[i] is the _id of hits[i], index-aligned and
+    always the same length. Do NOT try to request "_id" via source_fields — _id is
+    document metadata, not a _source field, so that returns nothing.
+
+    Exact index name only — no wildcards.
 
     Args:
-        index: Exact index name, e.g. "wazuh-alerts-4.x-2026.06.24".
-        doc_id: Document _id as returned by a prior search.
+        index: Exact index name, e.g. "wazuh-alerts-4.x-2026.06.24". No "/".
+        doc_id: Document _id, taken from the "ids" list of a prior search. No "/".
         query_string: Lucene query to evaluate against the document (default "*").
 
     Returns:
@@ -706,43 +730,10 @@ def opensearch_compare(
         }
     """
     client = get_client()
-    baseline = client.terms(
-        index, field,
-        query_string=query_string,
-        from_ts=baseline_from, to_ts=baseline_to,
-        ts_field=ts_field, size=size,
-    )
-    selection = client.terms(
-        index, field,
-        query_string=query_string,
-        from_ts=selection_from, to_ts=selection_to,
-        ts_field=ts_field, size=size,
-    )
-    b_warn = baseline.pop("_warning", None)
-    s_warn = selection.pop("_warning", None)
-
-    all_keys = set(baseline) | set(selection)
-    added, removed, changed, unchanged = {}, {}, {}, {}
-    for k in all_keys:
-        b, s = baseline.get(k), selection.get(k)
-        if b is None:
-            added[k] = s
-        elif s is None:
-            removed[k] = b
-        elif b != s:
-            pct = round((s - b) / b * 100, 1) if b else None
-            changed[k] = {"baseline": b, "selection": s, "delta": s - b, "pct_change": pct}
-        else:
-            unchanged[k] = {"baseline": b, "selection": s}
-
-    return {
-        "added":    added,
-        "removed":  removed,
-        "changed":  dict(sorted(changed.items(), key=lambda x: abs(x[1]["delta"]), reverse=True)),
-        "unchanged": unchanged,
-        "baseline_warning":  b_warn,
-        "selection_warning": s_warn,
-    }
+    window = dict(query_string=query_string, ts_field=ts_field, size=size)
+    baseline = client.terms(index, field, from_ts=baseline_from, to_ts=baseline_to, **window)
+    selection = client.terms(index, field, from_ts=selection_from, to_ts=selection_to, **window)
+    return compare_windows(baseline, selection)
 
 
 # ── Prompts ───────────────────────────────────────────────────────────────────
