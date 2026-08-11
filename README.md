@@ -576,6 +576,11 @@ cap). A missing key or a **duplicate `id`** is rejected with a clear `ValueError
 being absorbed — two specs sharing an id used to collapse into one result, so the caller received
 fewer answers than questions with no way to tell which field the numbers came from.
 
+**Ids must not start with `_`.** That prefix is reserved for response metadata such as
+`_warning`, which shares the result dict with the aggregations — so an id like `_warning`
+would come back as the warning string *instead of* the aggregation you asked for. An
+underscore anywhere else is fine: `agent_name` is a valid id.
+
 ```json
 {
   "agents":  {"WIN-DC01": 4821, "srv-web01": 2103},

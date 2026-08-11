@@ -215,6 +215,37 @@ def test_multi_terms_duplicate_ids_are_rejected(client, stub):
         )
 
 
+@pytest.mark.parametrize("reserved", ["_warning", "_x", "_"])
+def test_multi_terms_rejects_ids_starting_with_underscore(client, stub, reserved):
+    """The result dict holds aggregation results and metadata in one namespace, and
+    the id is caller-supplied — so an agent passing `id="_warning"` got the warning
+    string back *instead of* the aggregation it asked for. Verified reachable before
+    this guard existed.
+
+    Reserving the prefix closes it without changing the response shape. Restructuring
+    the output of `terms`, `multi_terms` and `discover_fields` would have broken every
+    consumer in order to handle a name a caller can simply be told not to use.
+    """
+    stub({"aggregations": {}})
+    with pytest.raises(ValueError, match="reserved for response metadata"):
+        client.multi_terms("idx", [{"id": reserved, "field": "agent.name"}])
+
+
+def test_multi_terms_allows_an_underscore_elsewhere_in_the_id():
+    """Only the leading underscore is reserved. `agent_name` is a perfectly ordinary
+    id and must not be caught by an over-broad rule."""
+    from tests.conftest import make_client
+
+    c = make_client()
+    c._resolve_backend = lambda: None
+    c._post = lambda p, body=None, params=None: {
+        "aggregations": {"agent_name": {"buckets": [{"key": "a", "doc_count": 1}]}}
+    }
+    assert c.multi_terms("idx", [{"id": "agent_name", "field": "agent.name"}]) == {
+        "agent_name": {"a": 1}
+    }
+
+
 # ── stats ─────────────────────────────────────────────────────────────────────
 
 FULL_STATS = {

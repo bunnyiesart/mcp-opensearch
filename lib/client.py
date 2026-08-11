@@ -1508,33 +1508,58 @@ class OpenSearchClient:
             )
         specs, seen = [], set()
         for position, spec in enumerate(kept):
-            if not isinstance(spec, dict):
-                raise ValueError(
-                    f"aggregations[{position}] must be a dict with 'id' and "
-                    f"'field' keys. Got: {spec!r}"
-                )
-            for key in ("id", "field"):
-                value = spec.get(key)
-                if not value or not isinstance(value, str):
-                    raise ValueError(
-                        f"aggregations[{position}] is missing a non-empty string "
-                        f"'{key}'. Each entry needs both, e.g. "
-                        '{"id": "agents", "field": "agent.name", "size": 20}. '
-                        f"Got: {spec!r}"
-                    )
-            if spec["id"] in seen:
-                raise ValueError(
-                    f"Duplicate aggregation id {spec['id']!r} at aggregations"
-                    f"[{position}]. Ids label the results, so they must be "
-                    "unique — otherwise two aggregations collapse into one and "
-                    "you cannot tell which field the counts belong to."
-                )
+            self._check_aggregation_shape(spec, position, seen)
             seen.add(spec["id"])
             capped = self._cap_terms_size(spec.get("size", 50))
             if capped != spec.get("size", 50):
                 warnings.append(f"[{spec['id']}] {self._terms_size_warning(spec.get('size'), capped)}")
             specs.append({"id": spec["id"], "field": spec["field"], "size": capped})
         return specs, warnings
+
+    @staticmethod
+    def _check_aggregation_shape(spec, position: int, seen: set):
+        """Raise ValueError unless `spec` is a usable aggregation request.
+
+        Split out of _validate_aggregations to keep each function under the
+        complexity ceiling the build enforces — the pre-condition checks and the
+        capping/accumulation are two separate jobs, and the ceiling firing was the
+        signal to separate them rather than to raise the ceiling.
+        """
+        if not isinstance(spec, dict):
+            raise ValueError(
+                f"aggregations[{position}] must be a dict with 'id' and "
+                f"'field' keys. Got: {spec!r}"
+            )
+        for key in ("id", "field"):
+            value = spec.get(key)
+            if not value or not isinstance(value, str):
+                raise ValueError(
+                    f"aggregations[{position}] is missing a non-empty string "
+                    f"'{key}'. Each entry needs both, e.g. "
+                    '{"id": "agents", "field": "agent.name", "size": 20}. '
+                    f"Got: {spec!r}"
+                )
+        if spec["id"].startswith("_"):
+            # The result dict carries both aggregation results and metadata
+            # ("_warning"), so a caller-supplied id beginning with "_" can collide
+            # with a metadata key and silently replace the aggregation the caller
+            # asked for with a warning string. Reserving the prefix closes that at
+            # no cost to the response shape; the alternative was restructuring the
+            # output of three tools, which would break every consumer for a case a
+            # caller can simply be told not to create.
+            raise ValueError(
+                f"aggregation id {spec['id']!r} at aggregations[{position}] "
+                "starts with '_', which is reserved for response metadata such "
+                "as '_warning'. Such an id would be overwritten by, or would "
+                "overwrite, that metadata. Choose a name not starting with '_'."
+            )
+        if spec["id"] in seen:
+            raise ValueError(
+                f"Duplicate aggregation id {spec['id']!r} at aggregations"
+                f"[{position}]. Ids label the results, so they must be "
+                "unique — otherwise two aggregations collapse into one and "
+                "you cannot tell which field the counts belong to."
+            )
 
     @staticmethod
     def _parse_ts(ts: str) -> float:
