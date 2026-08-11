@@ -1591,6 +1591,20 @@ class OpenSearchClient:
                 "e.g. '2026-06-23T00:00:00Z' — a space is not accepted by "
                 "OpenSearch either."
             )
+        # A zone designator may appear at most once, and only at the very end.
+        # This is enforced here rather than left to datetime.fromisoformat because
+        # fromisoformat's accepted grammar widened in Python 3.11: a malformed
+        # double-zone string like "…T00:00:00Z+00:00" is rejected on 3.11+ but was
+        # accepted on 3.10, so delegating made this parser's contract depend on the
+        # interpreter. The same server must not accept different timestamps on
+        # 3.10 and 3.13.
+        zone_marks = s.count("Z") + s.count("z")
+        if zone_marks > 1 or (zone_marks == 1 and s[-1] not in ("Z", "z")):
+            raise ValueError(
+                f"Cannot parse timestamp: {ts!r}. A zone designator may appear at "
+                "most once and only at the end — either a trailing 'Z' or a numeric "
+                "offset such as '+00:00', never both."
+            )
         # Suffix removal, not character-set stripping: "...ZZZ" is malformed and
         # must be rejected rather than silently read as a single Z.
         if s[-1] in ("Z", "z"):

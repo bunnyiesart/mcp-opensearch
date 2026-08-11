@@ -69,7 +69,6 @@ def test_parse_ts_result_is_utc_not_local():
         ("2024-01-01T00:00:00+00:00", EPOCH_2024),
         ("2024-01-01T00:00:00.000+00:00", EPOCH_2024),
         ("2024-01-01T00:00:00+0000", EPOCH_2024),
-        ("2024-01-01T00:00:00Z+00:00", EPOCH_2024),
         # A real offset must shift the instant, not merely be tolerated: 00:00 at
         # UTC-03:00 is 03:00 UTC.
         ("2024-01-01T00:00:00-03:00", EPOCH_2024 + 3 * 3600),
@@ -116,6 +115,29 @@ def test_parse_ts_error_message_shows_the_value_the_caller_passed():
     with pytest.raises(ValueError) as exc:
         parse("garbageZ")
     assert "'garbageZ'" in str(exc.value)
+
+
+@pytest.mark.parametrize(
+    "malformed",
+    [
+        "2024-01-01T00:00:00Z+00:00",   # trailing Z *and* a numeric offset
+        "2024-01-01T00:00:00Z-03:00",
+        "2024-01-01TZ00:00:00",         # zone marker not at the end
+    ],
+)
+def test_parse_ts_rejects_two_zone_designators(malformed):
+    """A zone may be given once, at the end — a trailing `Z` or a numeric offset,
+    never both.
+
+    This is enforced explicitly rather than delegated to `datetime.fromisoformat`,
+    whose accepted grammar widened in Python 3.11: these strings were accepted on
+    3.10 and rejected on 3.11+, so the parser's contract depended on the interpreter.
+    CI caught it — the 3.10 job passed while 3.11, 3.12 and 3.13 failed — which is
+    the argument for testing the declared floor and not only the newest version. The
+    same server must not accept different timestamps on different Pythons.
+    """
+    with pytest.raises(ValueError, match="Cannot parse timestamp"):
+        parse(malformed)
 
 
 def test_parse_ts_rejects_repeated_z_suffix():
