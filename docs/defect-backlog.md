@@ -11,7 +11,44 @@ the agent builds on it.
 
 Status legend: **done** · **in progress** · **open** · **accepted** (known, deliberately not fixed)
 
-## Where this stands at the end of 10 Aug 2026
+## Final status — 10 Aug 2026
+
+**456 passed, 3 skipped. `ruff check .` exits 0.** The 3 skips need `tomllib`
+(Python 3.11+) and run on the rest of the CI matrix.
+
+**Resolved in the second pass:** #1 (`test_connection` now always probes and returns
+`latency_ms`), #4 (retries moved under an explicit total deadline; transport failures
+translated; 429 given an actionable message), #5 (each backend's real cause named, and
+only relevant variables mentioned), #6 (re-probe policy plus immediate failover on
+transport failure), #7/#24-partial (compare diff extracted to `lib/compare.py`;
+`session=` injection seam added), #12 (both `.env` paths loaded explicitly and
+permission-gated alongside `config.json`), #16 (proxied GETs send no body), #21
+(`last_query_ms` surfaced via `latency_ms`, recorded on failures too;
+`OPENSEARCH_LOG_LEVEL` added; logging no longer hijacks the root logger and goes to
+stderr because stdout is the MCP transport), #23 (double-checked locking), T9
+(`_coerce_bool` rewritten), and all four fitness function groups the ADRs owed.
+
+**Two decisions deliberately not taken by an agent or by me:**
+
+| Item | Why it is still open |
+|---|---|
+| `_warning` namespace collision | Fixing it changes tool output shape, so it lands as its own change with a BREAKING changelog entry rather than buried in a batch. |
+| #18 packaging (ADR 0005, `Proposed`) | Renames a module every test file imports; cannot land partially; breaks the published import surface. Needs its own commit and review. |
+| Untagged `0.3.4` / `0.4.0` | Creating those tags fires the release workflow and publishes to PyPI and GHCR. Outward-facing and irreversible — maintainer's call, not an inference. |
+| ADR 0004 exclusion list | A security decision is not self-approvable. |
+
+**New defects found while fixing these, recorded not fixed:** `init_client`'s numeric
+env knobs (`OPENSEARCH_TIMEOUT` and the four `MAX_*`) have T9's disease — `int()` raises
+a bare `ValueError` naming neither the variable nor the accepted format, five instances;
+`_load_config` does not translate a malformed `config.json`'s `JSONDecodeError`, so it
+fails at startup naming neither the file nor the fix; `get_client()` has no negative
+caching, so now that `init_client` can raise on a bad credential file mode, every tool
+call retries the whole initialisation and re-probes the cluster; `Content-Type:
+application/json` is a session-wide header so it rides on bodiless GETs (harmless, and
+now symmetric between backends); and the direct probe accepts any 200 JSON from `GET /`,
+including a reverse proxy's error page, with `server_version == "?"` the only tell.
+
+## Where this stood earlier on 10 Aug 2026
 
 **Suite: 335 passed, 0 failed, 0 xfailed. `ruff check .` exits 0.** All eight
 `xfail(strict=True)` markers are gone, which is the load-bearing fact: with

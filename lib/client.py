@@ -16,6 +16,8 @@ import os
 import posixpath
 import re
 import stat
+import sys
+import time
 from datetime import datetime, timezone
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as _pkg_version
@@ -23,13 +25,21 @@ from urllib.parse import urlencode
 
 import requests
 from requests.adapters import HTTPAdapter
-from requests.exceptions import HTTPError
-from urllib3.util.retry import Retry
+from requests.exceptions import ConnectTimeout, ReadTimeout, RetryError, SSLError
 
 logger = logging.getLogger(__name__)
 
 CONFIG_DIR = os.path.expanduser("~/.config/mcp-opensearch")
 CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
+# The .env setup.sh writes and the README documents. Read explicitly: bare
+# load_dotenv() resolves via find_dotenv(), which walks up from *this file's*
+# directory, so this path was never read by the Python process at all.
+ENV_FILE = os.path.join(CONFIG_DIR, ".env")
+# A .env beside the checkout (the source-run path). Loaded on purpose, and
+# permission-checked exactly like the other two credential files.
+PROJECT_ENV_FILE = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env"
+)
 
 BACKEND_DASHBOARDS = "dashboards"
 BACKEND_OPENSEARCH = "opensearch"
@@ -55,6 +65,85 @@ MAX_HISTOGRAM_BUCKETS = 2000  # default cap on histogram buckets, overridable vi
 MAX_SAMPLE_SIZE = 100         # hard cap on discover_fields sample_size (no override)
 MAX_TERMS_SIZE = 1000         # default cap on a terms agg `size`, overridable via OPENSEARCH_MAX_TERMS_SIZE
 MAX_AGGREGATIONS = 20         # default cap on multi_terms agg count, overridable via OPENSEARCH_MAX_AGGREGATIONS
+
+DEFAULT_TIMEOUT = 60          # total wall-clock budget for ONE HTTP operation, incl. retries
+
+# ── Retry / time-budget policy ────────────────────────────────────────────────
+#
+# `self.timeout` is a **budget for the whole operation**, not a per-attempt
+# timeout. It used to be per attempt, mounted under urllib3's
+# Retry(total=3, backoff_factor=1), so one tool call could occupy
+# 4 attempts x 60 s + 6 s of backoff ~= 246 s — longer than any MCP client's tool
+# and spent hammering a cluster that is already shedding load. The retry loop now
+# lives in _send() with an explicit deadline, so the worst case is the budget
+# itself (measured: 60.0 s at timeout=60, 2.0 s at timeout=2).
+#
+# Deliberate asymmetry, and the reason a plain Retry() cannot express this:
+#   * a **read** timeout is never retried — the cluster is still executing the
+#     query, so a retry doubles the load it is failing to carry, and the first
+#     attempt already got the full budget;
+#   * a **connect** failure is retried, because it costs the cluster nothing and
+#     is the case that is genuinely transient;
+#   * 502/503/504 are retried, because a shedding node answers fast;
+#   * TLS failures are never retried — a bad certificate stays bad;
+#   * 429 is deliberately NOT retried. It means the cluster rejected the work
+#     (es_rejected_execution_exception, circuit breaker). Repeating the same
+#     oversized aggregation is exactly the wrong move; _raise_for_status says so
+#     and names the remedy instead.
+_MAX_ATTEMPTS = 3             # 1 initial attempt + at most 2 retries
+_RETRY_STATUSES = frozenset({502, 503, 504})
+_BACKOFF_BASE_SECONDS = 0.5   # doubles per retry: 0.5 s, 1.0 s
+_BACKOFF_MAX_SECONDS = 4.0
+_MIN_ATTEMPT_SECONDS = 2.0    # never start an attempt with less budget left than this
+_CONNECT_TIMEOUT_SECONDS = 10.0
+_PROBE_BUDGET_SECONDS = 10.0  # backend liveness probes get their own small budget
+
+# HTTP status → (message prefix, actionable hint). The prefixes "Bad request",
+# "Permission denied" and "Not found" are load-bearing: stats() keys off the
+# first one to add its own field-type advice.
+_STATUS_MESSAGES = {
+    400: ("Bad request", "Check your query syntax or field names."),
+    401: (
+        "Authentication failed",
+        "The credentials were rejected (HTTP 401). Check OPENSEARCH_USERNAME / "
+        "OPENSEARCH_PASSWORD, or username/password in "
+        "~/.config/mcp-opensearch/config.json.",
+    ),
+    403: ("Permission denied", "The authenticated user lacks the required privilege."),
+    404: ("Not found", "Check the index name or Dashboards version."),
+    429: (
+        "Rejected to shed load (HTTP 429)",
+        "The cluster refused the work — a full queue "
+        "(es_rejected_execution_exception) or a tripped circuit breaker. Do NOT "
+        "repeat the request unchanged: narrow the time range, reduce `size` or "
+        "the number of aggregations, aggregate on a keyword field instead of a "
+        "text one, or target one index instead of a wildcard. Then wait a few "
+        "seconds before retrying.",
+    ),
+    502: (
+        "Backend unavailable",
+        "A gateway or proxy in front of OpenSearch returned HTTP 502 after "
+        "retries. Check the Dashboards/reverse-proxy layer, not the query.",
+    ),
+    503: (
+        "Backend unavailable",
+        "OpenSearch answered HTTP 503 after retries — it is restarting, "
+        "shedding load, or has unassigned shards. Check cluster health before "
+        "trusting any other result.",
+    ),
+    504: (
+        "Backend timed out",
+        "A gateway in front of OpenSearch gave up (HTTP 504) after retries. "
+        "The query is likely too broad for the deployment's proxy timeout — "
+        "narrow the time range.",
+    ),
+}
+
+# Conventional boolean spellings, for env vars and JSON config values alike.
+# Anything outside these two sets is ambiguous and is rejected rather than
+# silently read as True.
+_TRUE_STRINGS = frozenset({"1", "true", "t", "yes", "y", "on"})
+_FALSE_STRINGS = frozenset({"0", "false", "f", "no", "n", "off"})
 
 # Interval string → seconds. The w/M/y values are nominal (7d / 30d / 365d) and
 # are used only to estimate a bucket count locally; the cluster does the real
@@ -304,6 +393,166 @@ def _flatten_list(values: list, prefix: str) -> dict:
     return out
 
 
+# ── Transport failure translation ─────────────────────────────────────────────
+#
+# A request that never produced an HTTP response used to escape this module raw:
+# urllib3's MaxRetryError arrives as requests.RetryError, which is NOT an
+# HTTPError, so _raise_for_status never saw it and the caller received
+# "RetryError: HTTPConnectionPool(...) (Caused by ResponseError('too many 503
+# error responses'))" — no indication of which backend, which URL, or what to do.
+# Connection refused, DNS failure and certificate rejection had the same problem.
+
+
+class TransportError(RuntimeError):
+    """No HTTP response was obtained: connection, TLS, timeout or retry exhaustion.
+
+    A RuntimeError subclass on purpose — every caller and every tool already
+    treats RuntimeError as "actionable failure with a readable message", so this
+    joins that family rather than starting a second one. `reason` is the short
+    cause phrase, reused by the backend-resolution error so it can name the real
+    cause per backend attempted.
+    """
+
+    def __init__(self, message: str, reason: str):
+        super().__init__(message)
+        self.reason = reason
+
+
+def _transport_reason(exc: Exception) -> str:
+    """Short phrase naming what actually failed. Never blames the URL by default."""
+    if isinstance(exc, SSLError):
+        return f"TLS verification failed ({exc})"
+    if isinstance(exc, ConnectTimeout):
+        return "connection timed out (no TCP/TLS handshake)"
+    if isinstance(exc, ReadTimeout):
+        return "the cluster accepted the request but did not answer in time"
+    if isinstance(exc, RetryError):
+        return f"retries exhausted ({exc})"
+    if isinstance(exc, requests.ConnectionError):
+        return f"unreachable ({exc.__class__.__name__}: {exc})"
+    if isinstance(exc, requests.Timeout):
+        return "timed out"
+    return f"{exc.__class__.__name__}: {exc}"
+
+
+def _transport_hint(exc: Exception, budget) -> str:
+    """What the operator should do about a transport failure."""
+    if isinstance(exc, SSLError):
+        return (
+            "Install the CA that signed the endpoint's certificate, or set "
+            "OPENSEARCH_VERIFY_SSL=false if you accept an unverified connection."
+        )
+    if isinstance(exc, (requests.Timeout, RetryError)):
+        return (
+            f"OPENSEARCH_TIMEOUT is the total budget for one call and is {budget}s. "
+            "Narrow the time range or reduce `size` first; raise the budget only "
+            "if the query is legitimately that slow."
+        )
+    return (
+        "Check the URL, that the port is open from here, and that the service is "
+        "running. This is a network/DNS/TLS failure, not a query or privilege problem."
+    )
+
+
+def _is_retryable_error(exc: Exception) -> bool:
+    """True for failures a second attempt can plausibly fix. See the policy note above."""
+    if isinstance(exc, (SSLError, ReadTimeout)):
+        return False
+    return isinstance(exc, (requests.ConnectionError, ConnectTimeout, RetryError))
+
+
+def _error_detail(r) -> str:
+    """OpenSearch's own explanation of a failure, or "" when it gave none.
+
+    Only structured fields are used (`error.reason`, `error.type`, Dashboards'
+    `message`) and the result is truncated — an HTML error page must not be
+    pasted into a tool response, but "unknown field [foo]" is the single most
+    useful thing a 400 can tell the caller and it used to be discarded.
+    """
+    try:
+        payload = r.json()
+    except (ValueError, AttributeError):
+        return ""
+    if not isinstance(payload, dict):
+        return ""
+    error = payload.get("error")
+    if isinstance(error, dict):
+        detail = _val(error, "reason") or _val(error, "type") or ""
+    elif isinstance(error, str):
+        detail = error
+    else:
+        detail = _val(payload, "message", "")
+    detail = " ".join(str(detail).split())
+    return f"Cluster said: {detail[:300]}" if detail else ""
+
+
+def _decode_json(r, context: str):
+    """`r.json()`, translating a non-JSON body into an actionable error.
+
+    A login page or an HTML proxy error answering with HTTP 200 used to surface as
+    a bare `json.JSONDecodeError` from inside the client.
+    """
+    try:
+        return r.json()
+    except ValueError as exc:
+        raise RuntimeError(
+            f"Non-JSON response: {context} (HTTP {getattr(r, 'status_code', '?')} "
+            f"from {getattr(r, 'url', '?')}). Something other than OpenSearch "
+            "answered — typically an SSO login page or a reverse-proxy error page."
+        ) from exc
+
+
+def _probe_status_reason(r) -> str:
+    """Why a liveness probe's non-200 response is not a usable backend."""
+    status = r.status_code
+    if status == 401:
+        return (
+            "authentication failed (HTTP 401) — check OPENSEARCH_USERNAME / "
+            "OPENSEARCH_PASSWORD"
+        )
+    if status == 403:
+        return (
+            "authenticated but not authorised (HTTP 403) — the account exists but "
+            "may not be allowed to use this backend"
+        )
+    if 300 <= status < 400:
+        location = r.headers.get("Location", "an undisclosed location")
+        return (
+            f"redirected (HTTP {status}) to {location} — typically an SSO login "
+            "flow in front of the API"
+        )
+    detail = _error_detail(r)
+    return f"HTTP {status}" + (f" — {detail}" if detail else "")
+
+
+def _resolution_error(attempts: list, dashboards_url, opensearch_url) -> str:
+    """The message raised when no backend resolved.
+
+    Names the real cause for each backend actually attempted, and mentions an
+    environment variable only when it is relevant to what was tried — the old
+    message told operators who had only ever set OPENSEARCH_DASHBOARDS_URL to go
+    and check OPENSEARCH_URL.
+    """
+    if not attempts:
+        return (
+            "No OpenSearch backend is configured. Set OPENSEARCH_DASHBOARDS_URL or "
+            "OPENSEARCH_URL (or dashboards_url / opensearch_url in "
+            f"{CONFIG_FILE})."
+        )
+    parts = ["Could not reach any OpenSearch backend. What was tried:"]
+    parts += [f"  - {label}: {reason}" for label, reason in attempts]
+    if not opensearch_url:
+        parts.append(
+            "  OPENSEARCH_URL is not set, so no direct-OpenSearch fallback was "
+            "attempted. Set it if port 9200 is reachable from here."
+        )
+    elif not dashboards_url:
+        parts.append(
+            "  OPENSEARCH_DASHBOARDS_URL is not set, so Dashboards was not attempted."
+        )
+    return "\n".join(parts)
+
+
 class OpenSearchClient:
     """Read-only client for OpenSearch / OpenSearch Dashboards.
 
@@ -321,11 +570,11 @@ class OpenSearchClient:
     credential surfaces (security plugin, snapshot repositories, cluster
     settings), but it is not a substitute for a least-privilege account.
 
-    Three methods call self._session directly instead of _get/_post:
-    _resolve_backend() probes GET /api/status and GET / for version discovery,
-    _dashboards_proxy() posts the already-checked path to the Dashboards console
-    proxy, and list_index_patterns() reads the Dashboards saved-objects APIs.
-    None of them takes a caller-supplied path.
+    Four methods name self._session directly instead of going through _get/_post:
+    _probe() issues the two literal liveness-probe URLs, _dashboards_proxy() posts
+    an already-checked path to the Dashboards console proxy, list_index_patterns()
+    reads the two literal Dashboards saved-object endpoints, and _get/_post
+    themselves. None of them takes a caller-supplied path.
     """
 
     def __init__(
@@ -335,12 +584,29 @@ class OpenSearchClient:
         username=None,
         password=None,
         verify_ssl=True,
-        timeout=60,
+        timeout=DEFAULT_TIMEOUT,
         max_search_limit=MAX_SEARCH_LIMIT,
         max_histogram_buckets=MAX_HISTOGRAM_BUCKETS,
         max_terms_size=MAX_TERMS_SIZE,
         max_aggregations=MAX_AGGREGATIONS,
+        backend_recheck_seconds=300,
+        session=None,
     ):
+        """Build a client.
+
+        timeout: total wall-clock budget for one HTTP operation, retries and
+            backoff included — not a per-attempt timeout. See the retry policy
+            note at the top of this module.
+        backend_recheck_seconds: how long a *degraded* backend resolution (a
+            Dashboards URL is configured but the direct API won the probe) may be
+            reused before it is re-probed. A resolution that got the preferred
+            backend is never re-probed on a schedule; it is dropped on failure
+            instead, so the steady state costs no extra round trips.
+        session: optional requests.Session to use instead of building one — the
+            injection seam for tests and for callers that need their own
+            connection pool. Its auth and headers are configured here; its
+            adapters are left alone, because transport is then the caller's call.
+        """
         self.dashboards_url = dashboards_url.rstrip("/") if dashboards_url else None
         self.opensearch_url = opensearch_url.rstrip("/") if opensearch_url else None
         self.verify_ssl = verify_ssl
@@ -349,11 +615,20 @@ class OpenSearchClient:
         self.max_histogram_buckets = max_histogram_buckets
         self.max_terms_size = max_terms_size
         self.max_aggregations = max_aggregations
+        self.backend_recheck_seconds = backend_recheck_seconds
         self.backend = None
         self.server_version = None
+        # Latency of the most recent HTTP attempt, success or failure. Reported by
+        # test_connection() as "latency_ms" and logged per request at DEBUG — it
+        # used to be assigned in four places, read in none, and written only after
+        # the error check, so failures (the case worth measuring) recorded nothing.
         self.last_query_ms = 0
+        self._backend_resolved_at = None
+        # [(backend label, reason it was not usable)] from the last resolution.
+        # Keeps list_index_patterns able to say why Dashboards is not active.
+        self._backend_attempts = []
 
-        self._session = requests.Session()
+        self._session = requests.Session() if session is None else session
         if username and password:
             self._session.auth = (username, password)
 
@@ -364,15 +639,14 @@ class OpenSearchClient:
             "User-Agent": f"mcp-opensearch/{_package_version()}",
         })
 
-        retry = Retry(
-            total=3,
-            backoff_factor=1,
-            status_forcelist=[502, 503, 504],
-            allowed_methods=["GET", "POST"],
-        )
-        adapter = HTTPAdapter(max_retries=retry)
-        self._session.mount("http://", adapter)
-        self._session.mount("https://", adapter)
+        if session is None:
+            # No transport-level retries: _send() owns retrying, because only a
+            # deadline-aware loop can bound the wall time of one tool call. An
+            # adapter-level Retry multiplies the timeout instead, and raises
+            # RetryError, which bypasses every message this class produces.
+            adapter = HTTPAdapter(max_retries=0)
+            self._session.mount("http://", adapter)
+            self._session.mount("https://", adapter)
 
     # ── Read-only guard ───────────────────────────────────────
 
@@ -414,80 +688,241 @@ class OpenSearchClient:
 
     @staticmethod
     def _raise_for_status(r, context: str):
-        """Re-raise HTTP errors as clean RuntimeErrors with actionable messages."""
+        """Re-raise HTTP errors as clean RuntimeErrors with actionable messages.
+
+        Post-condition: returns None only for a response below 400. Every 4xx/5xx
+        raises a RuntimeError naming the context, what the status means for this
+        client, and whatever the cluster itself said about it.
+
+        429 is handled here rather than by retrying: see the retry policy note at
+        the top of this module.
+        """
+        if r.status_code < 400:
+            return
+        prefix, hint = _STATUS_MESSAGES.get(
+            r.status_code, (f"HTTP {r.status_code}", "")
+        )
+        detail = _error_detail(r)
+        message = " ".join(p for p in (f"{prefix}: {context}.", hint, detail) if p)
+        raise RuntimeError(message) from None
+
+    # ── Transport: one bounded HTTP operation ─────────────────
+
+    def _record(self, context: str, started: float, status):
+        """Record and log the latency of one attempt, successful or not."""
+        self.last_query_ms = int((time.monotonic() - started) * 1000)
+        logger.debug(
+            "%s -> %s in %d ms (backend=%s)",
+            context, status if status is not None else "transport error",
+            self.last_query_ms, self.backend,
+        )
+
+    def _attempt(self, send, url: str, context: str, deadline: float, kwargs: dict):
+        """One HTTP attempt inside the operation's deadline.
+
+        Returns ("ok", response), ("retry_status", response) for 502/503/504, or
+        ("error", exception) when no response was obtained. Never raises for a
+        network failure — _send decides what is retryable and what is fatal.
+        """
+        remaining = max(deadline - time.monotonic(), _MIN_ATTEMPT_SECONDS)
+        started = time.monotonic()
         try:
-            r.raise_for_status()
-        except HTTPError:
-            status = r.status_code
-            if status == 403:
-                raise RuntimeError(
-                    f"Permission denied: {context}. "
-                    "The authenticated user lacks the required privilege."
-                ) from None
-            if status == 404:
-                raise RuntimeError(
-                    f"Not found: {context}. "
-                    "Check the index name or Dashboards version."
-                ) from None
-            if status == 400:
-                raise RuntimeError(
-                    f"Bad request: {context}. "
-                    "Check your query syntax or field names."
-                ) from None
-            raise RuntimeError(f"HTTP {status}: {context}.") from None
+            r = send(
+                url,
+                timeout=(min(_CONNECT_TIMEOUT_SECONDS, remaining), remaining),
+                verify=self.verify_ssl,
+                **kwargs,
+            )
+        except requests.RequestException as exc:
+            self._record(context, started, None)
+            return "error", exc
+        self._record(context, started, r.status_code)
+        return ("retry_status" if r.status_code in _RETRY_STATUSES else "ok"), r
+
+    def _wait_for_retry(self, attempt: int, deadline: float) -> bool:
+        """Sleep this attempt's backoff and report whether another attempt fits.
+
+        This is the bound: a retry happens only when the attempt allowance is left
+        AND enough of the wall-clock budget remains for the backoff plus a
+        worthwhile attempt, so retrying can never push an operation past its
+        deadline.
+        """
+        if attempt >= _MAX_ATTEMPTS:
+            return False
+        backoff = min(
+            _BACKOFF_BASE_SECONDS * (2 ** (attempt - 1)), _BACKOFF_MAX_SECONDS
+        )
+        if deadline - time.monotonic() < backoff + _MIN_ATTEMPT_SECONDS:
+            return False
+        logger.info(
+            "Retrying in %.1fs (attempt %d of %d)", backoff, attempt + 1, _MAX_ATTEMPTS
+        )
+        time.sleep(backoff)
+        return True
+
+    def _send(self, send, url: str, context: str, *, budget=None, check_status=True, **kwargs):
+        """Issue one HTTP operation with bounded retries and a hard time budget.
+
+        `send` is a bound session method (`self._session.get` / `.post`), passed in
+        so that retry, timeout, latency recording and error translation exist in
+        exactly one place instead of once per call site.
+
+        Post-conditions:
+          * total wall time <= the budget (default self.timeout) plus the cost of
+            one in-flight attempt returning;
+          * a failure to obtain a response raises TransportError — a RuntimeError
+            with the real cause named — never a raw RetryError/ConnectionError;
+          * a 4xx/5xx raises via _raise_for_status unless check_status=False, which
+            liveness probes and the index-pattern endpoint fallback use because
+            they need to inspect the status themselves;
+          * self.last_query_ms reflects the final attempt either way.
+        """
+        deadline = time.monotonic() + (self.timeout if budget is None else budget)
+        started = time.monotonic()
+        attempt = 0
+        while True:
+            attempt += 1
+            kind, value = self._attempt(send, url, context, deadline, kwargs)
+            retryable = kind == "retry_status" or (
+                kind == "error" and _is_retryable_error(value)
+            )
+            if retryable and self._wait_for_retry(attempt, deadline):
+                continue
+            if kind == "error":
+                # The backend itself failed, so stop trusting the cached
+                # resolution: the next call re-probes and can fail over.
+                self._forget_backend()
+                raise self._transport_error(
+                    value, context, attempt, time.monotonic() - started
+                ) from value
+            if check_status:
+                self._raise_for_status(value, context)
+            return value
+
+    def _transport_error(self, exc, context: str, attempts: int, elapsed: float) -> TransportError:
+        """Build the actionable error for a request that never got a response."""
+        reason = _transport_reason(exc)
+        return TransportError(
+            f"Cannot reach OpenSearch: {reason}: {context} — gave up after "
+            f"{attempts} attempt(s) in {elapsed:.1f}s of a {self.timeout}s budget. "
+            f"{_transport_hint(exc, self.timeout)}",
+            reason,
+        )
 
     # ── Backend resolution ────────────────────────────────────
 
-    def _resolve_backend(self):
-        """Probe Dashboards first, then direct OpenSearch. Raises if both fail."""
+    def _forget_backend(self):
+        """Drop the cached resolution so the next call re-probes and can fail over."""
         if self.backend is not None:
-            return
+            logger.warning(
+                "Backend %s failed — dropping the cached resolution; the next call re-probes",
+                self.backend,
+            )
+        self.backend = None
+        self._backend_resolved_at = None
 
+    def _is_degraded(self) -> bool:
+        """True when the active backend is not the preferred one for this config."""
+        return bool(self.dashboards_url) and self.backend != BACKEND_DASHBOARDS
+
+    def _needs_resolution(self) -> bool:
+        """Whether _resolve_backend must probe rather than reuse its cached answer.
+
+        Policy, and why (backlog #6 — one 401 or SSO redirect at first-call time
+        used to demote the backend for the entire life of a long-running MCP
+        server, with no way back short of a restart):
+
+          * nothing resolved yet -> probe;
+          * the preferred backend is active -> never probe on a schedule. Adding a
+            round trip to every request to detect a failure the request itself
+            will report is a poor trade; a failed request calls _forget_backend()
+            instead, so recovery costs one probe on the *next* call;
+          * a degraded resolution (Dashboards configured, direct API won) -> probe
+            again once backend_recheck_seconds has passed, so a transient
+            Dashboards fault heals itself within that window at a cost of at most
+            one extra round trip per window;
+          * a backend set from outside (tests, callers) has no recorded age and is
+            taken at face value.
+        """
+        if self.backend is None:
+            return True
+        if not self._is_degraded() or self._backend_resolved_at is None:
+            return False
+        return (time.monotonic() - self._backend_resolved_at) >= self.backend_recheck_seconds
+
+    def _candidates(self) -> list:
+        """(probe url, backend, context, operator-facing label) in preference order."""
+        candidates = []
         if self.dashboards_url:
-            try:
-                r = self._session.get(
-                    f"{self.dashboards_url}/api/status",
-                    verify=self.verify_ssl,
-                    timeout=10,
-                )
-                if r.status_code == 200:
-                    data = r.json()
-                    self.backend = BACKEND_DASHBOARDS
-                    self.server_version = _val(_dig(data, "version"), "number", "?")
-                    logger.info(
-                        "Backend: OpenSearch Dashboards %s (v%s)",
-                        self.dashboards_url, self.server_version,
-                    )
-                    return
-                logger.warning(
-                    "Dashboards returned HTTP %s — trying direct OpenSearch",
-                    r.status_code,
-                )
-            except Exception as exc:
-                logger.warning("Dashboards unreachable (%s) — trying direct OpenSearch", exc)
-
+            candidates.append((
+                f"{self.dashboards_url}/api/status",
+                BACKEND_DASHBOARDS,
+                "GET /api/status (Dashboards liveness probe)",
+                f"OpenSearch Dashboards {self.dashboards_url} (OPENSEARCH_DASHBOARDS_URL)",
+            ))
         if self.opensearch_url:
-            try:
-                r = self._session.get(
-                    f"{self.opensearch_url}/",
-                    verify=self.verify_ssl,
-                    timeout=10,
-                )
-                self._raise_for_status(r, "GET /")
-                data = r.json()
-                self.backend = BACKEND_OPENSEARCH
-                self.server_version = _val(_dig(data, "version"), "number", "?")
-                logger.info(
-                    "Backend: direct OpenSearch %s (v%s)",
-                    self.opensearch_url, self.server_version,
-                )
-                return
-            except Exception as exc:
-                logger.error("Direct OpenSearch also unreachable: %s", exc)
+            candidates.append((
+                f"{self.opensearch_url}/",
+                BACKEND_OPENSEARCH,
+                "GET / (OpenSearch liveness probe)",
+                f"direct OpenSearch {self.opensearch_url} (OPENSEARCH_URL)",
+            ))
+        return candidates
 
+    def _probe(self, url: str, backend: str, context: str):
+        """Probe one backend. Returns None on success, else the reason it lost.
+
+        The reason is the point: the two bare `except Exception` blocks this
+        replaces collapsed 401, an expired certificate and "nothing is listening"
+        into one message that told the operator to check the URL.
+        """
+        try:
+            r = self._send(
+                self._session.get, url, context,
+                budget=min(_PROBE_BUDGET_SECONDS, self.timeout), check_status=False,
+            )
+        except TransportError as exc:
+            logger.warning("%s: %s", context, exc.reason)
+            return exc.reason
+        if r.status_code != 200:
+            reason = _probe_status_reason(r)
+            logger.warning("%s: %s", context, reason)
+            return reason
+        try:
+            data = r.json()
+        except ValueError:
+            return (
+                f"answered HTTP 200 with a non-JSON body (final URL {r.url}) — "
+                "typically an SSO or login page rather than the API"
+            )
+        self.backend = backend
+        self.server_version = _val(_dig(data, "version"), "number", "?")
+        self._backend_resolved_at = time.monotonic()
+        logger.info(
+            "Backend: %s %s (v%s), probe %d ms",
+            backend, url, self.server_version, self.last_query_ms,
+        )
+        return None
+
+    def _resolve_backend(self, force: bool = False):
+        """Resolve the active backend, Dashboards first, then direct OpenSearch.
+
+        Raises RuntimeError naming what was attempted and why each attempt failed.
+        See _needs_resolution for the caching policy; `force=True` always probes,
+        which is what makes test_connection() an honest liveness check.
+        """
+        if not force and not self._needs_resolution():
+            return
+        attempts = []
+        self._backend_attempts = attempts
+        for url, backend, context, label in self._candidates():
+            reason = self._probe(url, backend, context)
+            if reason is None:
+                return
+            attempts.append((label, reason))
+        self._forget_backend()
         raise RuntimeError(
-            "Could not connect to OpenSearch Dashboards or direct OpenSearch. "
-            "Check OPENSEARCH_DASHBOARDS_URL / OPENSEARCH_URL."
+            _resolution_error(attempts, self.dashboards_url, self.opensearch_url)
         )
 
     # ── Low-level requests ────────────────────────────────────
@@ -497,50 +932,50 @@ class OpenSearchClient:
         self._resolve_backend()
         if self.backend == BACKEND_DASHBOARDS:
             return self._dashboards_proxy("GET", path, params=params)
-        r = self._session.get(
-            f"{self.opensearch_url}{path}",
-            params=params,
-            verify=self.verify_ssl,
-            timeout=self.timeout,
+        context = f"GET {path}"
+        r = self._send(
+            self._session.get, f"{self.opensearch_url}{path}", context, params=params
         )
-        self._raise_for_status(r, f"GET {path}")
-        self.last_query_ms = int(r.elapsed.total_seconds() * 1000)
-        return r.json()
+        return _decode_json(r, context)
 
     def _post(self, path: str, body: dict | None = None, params: dict | None = None) -> dict:
         self._check_path("POST", path)
         self._resolve_backend()
         if self.backend == BACKEND_DASHBOARDS:
             return self._dashboards_proxy("POST", path, body=body, params=params)
-        r = self._session.post(
+        context = f"POST {path}"
+        r = self._send(
+            self._session.post,
             f"{self.opensearch_url}{path}",
+            context,
             json=body,
             params=params,
-            verify=self.verify_ssl,
-            timeout=self.timeout,
         )
-        self._raise_for_status(r, f"POST {path}")
-        self.last_query_ms = int(r.elapsed.total_seconds() * 1000)
-        return r.json()
+        return _decode_json(r, context)
 
     def _dashboards_proxy(
         self, method: str, path: str, body: dict | None = None, params: dict | None = None
     ) -> dict:
-        """Route an OpenSearch request through Dashboards /api/console/proxy."""
+        """Route an OpenSearch request through Dashboards /api/console/proxy.
+
+        No body is sent when there is none. `json=body or {}` used to put a 2-byte
+        `{}` on the wire for every proxied GET, which the direct path never does —
+        so cluster_health, list_indices, get_mapping, index_settings and get_alerts
+        differed between backends on handlers that declare no body. Nothing proved
+        the two paths equivalent; now one line fewer makes them differ.
+        """
         os_path = path.lstrip("/")
         if params:
             os_path = f"{os_path}?{urlencode(params)}"
-
-        r = self._session.post(
+        context = f"{method} {path} (via Dashboards proxy)"
+        r = self._send(
+            self._session.post,
             f"{self.dashboards_url}/api/console/proxy",
+            context,
             params={"path": os_path, "method": method},
-            json=body or {},
-            verify=self.verify_ssl,
-            timeout=self.timeout,
+            json=body if body else None,
         )
-        self._raise_for_status(r, f"{method} {path} (via Dashboards proxy)")
-        self.last_query_ms = int(r.elapsed.total_seconds() * 1000)
-        return r.json()
+        return _decode_json(r, context)
 
     # ── Query builders ────────────────────────────────────────
 
@@ -593,8 +1028,22 @@ class OpenSearchClient:
     # ── Public read-only API ──────────────────────────────────
 
     def test_connection(self) -> dict:
-        """Probe connectivity. Returns backend, version, URL, and authenticated username."""
-        self._resolve_backend()
+        """Probe connectivity for real. Returns backend, version, URL, username, latency.
+
+        Always issues one request (a ~10s-budget liveness probe), and re-runs the
+        backend preference order, so it doubles as the manual failover trigger.
+
+        This used to be the one tool that could not fail: it called
+        _resolve_backend(), which returned immediately once a backend was cached,
+        so after the first successful call it performed no I/O at all and answered
+        {"ok": true} against a dead cluster. Its own docstring tells the agent to
+        call it first to confirm connectivity, so a false green here made every
+        subsequent failure look like a privilege or index-name problem.
+
+        Raises RuntimeError (naming the real cause per backend) when nothing is
+        reachable — "ok": True is now a fact about this instant, not a memory.
+        """
+        self._resolve_backend(force=True)
         return {
             "ok": True,
             "backend": self.backend,
@@ -605,6 +1054,7 @@ class OpenSearchClient:
                 else self.opensearch_url
             ),
             "username": self._session.auth[0] if self._session.auth else None,
+            "latency_ms": self.last_query_ms,
         }
 
     def cluster_health(self) -> dict:
@@ -621,14 +1071,44 @@ class OpenSearchClient:
             return sorted(data, key=lambda x: str(_val(x, "index", "")))
         return data
 
-    def list_index_patterns(self) -> list:
-        """List Dashboards saved index patterns. Dashboards backend only."""
-        self._resolve_backend()
-        if self.backend != BACKEND_DASHBOARDS:
-            raise RuntimeError(
-                "list_index_patterns requires the OpenSearch Dashboards backend. "
-                "Set OPENSEARCH_DASHBOARDS_URL to enable it."
+    def _no_dashboards_message(self) -> str:
+        """Why the Dashboards backend is not active, truthfully.
+
+        The old message said "Set OPENSEARCH_DASHBOARDS_URL to enable it" even when
+        it was set and the probe had merely been refused — and this tool is the
+        documented fallback for a 403 on _cat/indices, so that lie cost an
+        investigation step at exactly the wrong moment.
+        """
+        head = "list_index_patterns requires the OpenSearch Dashboards backend."
+        if not self.dashboards_url:
+            return (
+                f"{head} OPENSEARCH_DASHBOARDS_URL is not set, so no Dashboards "
+                f"was ever probed; the active backend is {self.backend}. Set it to "
+                "enable this tool, or use list_indices instead."
             )
+        reasons = [
+            reason for label, reason in self._backend_attempts
+            if label.startswith("OpenSearch Dashboards")
+        ]
+        why = reasons[-1] if reasons else "the probe did not succeed"
+        return (
+            f"{head} OPENSEARCH_DASHBOARDS_URL is set ({self.dashboards_url}) but "
+            f"its /api/status probe failed: {why}. The active backend is "
+            f"{self.backend}, which has no saved index patterns — fix the "
+            "Dashboards problem above, or use list_indices."
+        )
+
+    def list_index_patterns(self) -> list:
+        """List Dashboards saved index patterns. Dashboards backend only.
+
+        Re-probes before refusing when a Dashboards URL is configured but is not
+        the active backend: this tool exists precisely for the case where direct
+        access is restricted, so a stale demotion must not be allowed to make it
+        permanently unavailable.
+        """
+        self._resolve_backend(force=self._is_degraded())
+        if self.backend != BACKEND_DASHBOARDS:
+            raise RuntimeError(self._no_dashboards_message())
         # Try saved_objects API (Dashboards 2.x), then data_views API (newer versions)
         for endpoint, params, extractor in [
             (
@@ -656,16 +1136,18 @@ class OpenSearchClient:
                 ],
             ),
         ]:
-            r = self._session.get(
+            context = f"GET {endpoint} (index patterns)"
+            r = self._send(
+                self._session.get,
                 f"{self.dashboards_url}{endpoint}",
+                context,
                 params=params,
-                verify=self.verify_ssl,
-                timeout=self.timeout,
+                check_status=False,
             )
             if r.status_code == 404:
                 continue
-            self._raise_for_status(r, f"GET {endpoint} (index patterns)")
-            return extractor(r.json())
+            self._raise_for_status(r, context)
+            return extractor(_decode_json(r, context))
         raise RuntimeError(
             "Could not list index patterns — neither /api/saved_objects/_find "
             "nor /api/data_views returned a valid response. "
@@ -1480,30 +1962,140 @@ class OpenSearchClient:
 
 # ── Config loading ────────────────────────────────────────────────────────────
 
+def _allow_insecure_config() -> bool:
+    """Whether the 0600 requirement on credential files is downgraded to a warning."""
+    return _coerce_bool(
+        os.environ.get("OPENSEARCH_ALLOW_INSECURE_CONFIG"),
+        default=False,
+        name="OPENSEARCH_ALLOW_INSECURE_CONFIG",
+    )
+
+
+def _require_private(path: str, what: str):
+    """Refuse to read a credential file that other users can read.
+
+    Applied to every file this module reads secrets from, which previously meant
+    config.json only: the `.env` path had no check at all, so a world-readable
+    file full of passwords was loaded in silence. One rule, all three paths, same
+    OPENSEARCH_ALLOW_INSECURE_CONFIG escape hatch.
+    """
+    file_stat = os.stat(path)
+    if not file_stat.st_mode & 0o077:
+        return
+    msg = (
+        f"{what} {path} is readable by other users "
+        f"(mode {stat.filemode(file_stat.st_mode)}). "
+        f"Run: chmod 600 {path}"
+    )
+    if _allow_insecure_config():
+        logger.warning(msg)
+    else:
+        raise PermissionError(msg)
+
+
 def _load_config() -> dict:
     if not os.path.exists(CONFIG_FILE):
         return {}
-    file_stat = os.stat(CONFIG_FILE)
-    if file_stat.st_mode & 0o077:
-        msg = (
-            f"Config file {CONFIG_FILE} is readable by other users "
-            f"(mode {stat.filemode(file_stat.st_mode)}). "
-            f"Run: chmod 600 {CONFIG_FILE}"
-        )
-        if os.environ.get("OPENSEARCH_ALLOW_INSECURE_CONFIG", "").lower() == "true":
-            logger.warning(msg)
-        else:
-            raise PermissionError(msg)
+    _require_private(CONFIG_FILE, "Config file")
     with open(CONFIG_FILE) as f:
         return json.load(f)
 
 
-def _coerce_bool(value, default=True) -> bool:
-    if isinstance(value, str):
-        return value.lower() != "false"
+def _load_env_files() -> list:
+    """Load the .env files this project documents, explicitly. Returns paths loaded.
+
+    Two named paths, in this order (load_dotenv never overrides a real environment
+    variable, so the first file to define a key wins):
+
+      1. `<checkout>/.env`                     — the source-run / development path
+      2. `~/.config/mcp-opensearch/.env`       — what setup.sh writes and the README documents
+
+    Both are permission-checked. Previously `load_dotenv()` was called with no
+    argument, so find_dotenv() walked up from the directory of *this file* — which
+    meant (a) the documented ~/.config path was never read by the Python process
+    at all, and (b) a .env beside the source was read silently whatever its mode.
+    """
+    try:
+        from dotenv import load_dotenv
+    except ImportError:
+        return []
+    loaded = []
+    for path in (PROJECT_ENV_FILE, ENV_FILE):
+        if not os.path.isfile(path):
+            continue
+        _require_private(path, "Credential file")
+        load_dotenv(path)
+        logger.info("Loaded environment from %s", path)
+        loaded.append(path)
+    return loaded
+
+
+def _configure_logging():
+    """Apply OPENSEARCH_LOG_LEVEL to this package's logger, if it is set.
+
+    Needed because server.py calls logging.basicConfig(level=WARNING), which
+    silences the only lines that say which backend won and why the other lost.
+    Setting the level on this package's own logger is enough: propagated records
+    are gated by the originating logger and by handler levels, not by the root
+    logger's level.
+
+    Logs go to stderr. stdout is the MCP stdio transport and a stray line there
+    corrupts the protocol.
+    """
+    name = os.environ.get("OPENSEARCH_LOG_LEVEL")
+    if not name:
+        return
+    level = logging.getLevelName(name.strip().upper())
+    if not isinstance(level, int):
+        raise ValueError(
+            f"OPENSEARCH_LOG_LEVEL={name!r} is not a log level. "
+            "Use DEBUG, INFO, WARNING, ERROR or CRITICAL."
+        )
+    package_logger = logging.getLogger(__name__.split(".")[0])
+    package_logger.setLevel(level)
+    if not logging.getLogger().handlers and not package_logger.handlers:
+        handler = logging.StreamHandler(sys.stderr)
+        handler.setFormatter(logging.Formatter("%(levelname)s %(name)s: %(message)s"))
+        package_logger.addHandler(handler)
+
+
+def _coerce_bool(value, default=True, *, name="value") -> bool:
+    """Interpret an env-var string or a JSON config value as a bool.
+
+    Accepts the conventional spellings, case-insensitively and whitespace-stripped:
+    true/false, 1/0, yes/no, y/n, t/f, on/off. `None` and an empty/whitespace-only
+    string mean "not set" and yield `default` — an empty environment variable is
+    how every shell spells "unset", and disabling TLS verification must be
+    deliberate. Real bools pass through. `0`/`1` as integers are accepted.
+
+    Raises:
+        ValueError: for anything else, naming `name` and the accepted spellings.
+            The old implementation compared against the single literal "false" and
+            discarded any non-str/non-bool, so "0", "no", "off", "false " (a
+            hand-edited .env leaves the trailing space) and the integer 0 all came
+            back True — OPENSEARCH_VERIFY_SSL=0 silently did not disable
+            verification. Guessing is what made that a silent foot-gun, so
+            ambiguity is now refused rather than resolved to the default.
+    """
     if isinstance(value, bool):
         return value
-    return default
+    if value is None:
+        return default
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if not text:
+            return default
+        if text in _TRUE_STRINGS:
+            return True
+        if text in _FALSE_STRINGS:
+            return False
+    elif isinstance(value, int) and value in (0, 1):
+        return bool(value)
+    raise ValueError(
+        f"Cannot interpret {name}={value!r} as a boolean. Use one of "
+        "true/false, 1/0, yes/no, y/n, t/f, on/off (case-insensitive), "
+        "or leave it unset."
+    )
 
 
 def init_client() -> OpenSearchClient:
@@ -1515,22 +2107,35 @@ def init_client() -> OpenSearchClient:
         OPENSEARCH_URL                   — e.g. https://opensearch.example.com:9200 (fallback)
         OPENSEARCH_USERNAME
         OPENSEARCH_PASSWORD
-        OPENSEARCH_VERIFY_SSL            — "true"/"false" (default: true). Only the
-                                           exact string "false" disables it.
-        OPENSEARCH_TIMEOUT               — seconds per request (default: 60)
+        OPENSEARCH_VERIFY_SSL            — true/false, 1/0, yes/no, on/off
+                                           (default: true). Anything else is an
+                                           error rather than a silent default.
+        OPENSEARCH_TIMEOUT               — total wall-clock budget in seconds for
+                                           ONE call, retries included (default: 60)
         OPENSEARCH_MAX_SEARCH_LIMIT      — default cap on search results (default: 200)
         OPENSEARCH_MAX_HISTOGRAM_BUCKETS — default cap on histogram buckets (default: 2000)
         OPENSEARCH_MAX_TERMS_SIZE        — default cap on a terms agg size (default: 1000)
         OPENSEARCH_MAX_AGGREGATIONS      — default cap on multi_terms agg count (default: 20)
-        OPENSEARCH_ALLOW_INSECURE_CONFIG — "true" downgrades the 0600 permission
-                                           check on config.json from a hard
-                                           PermissionError to a logged warning
+        OPENSEARCH_LOG_LEVEL             — DEBUG/INFO/WARNING/ERROR/CRITICAL for
+                                           this package's logger, to stderr
+                                           (default: inherit whatever the host
+                                           process configured). INFO shows which
+                                           backend won and why the other lost;
+                                           DEBUG adds per-request latency.
+        OPENSEARCH_ALLOW_INSECURE_CONFIG — true downgrades the 0600 permission
+                                           check on config.json AND on both .env
+                                           paths from a hard PermissionError to a
+                                           logged warning
+
+    Credential files read, in order (the first definition of a key wins, and a
+    real environment variable always beats all of them). All three are refused
+    unless they are 0600, see OPENSEARCH_ALLOW_INSECURE_CONFIG:
+        <checkout>/.env
+        ~/.config/mcp-opensearch/.env
+        ~/.config/mcp-opensearch/config.json
     """
-    try:
-        from dotenv import load_dotenv
-        load_dotenv()
-    except ImportError:
-        pass
+    _load_env_files()
+    _configure_logging()
 
     config = _load_config()
 
@@ -1547,10 +2152,10 @@ def init_client() -> OpenSearchClient:
 
     env_ssl = os.environ.get("OPENSEARCH_VERIFY_SSL")
     verify_ssl = (
-        _coerce_bool(env_ssl) if env_ssl is not None
-        else _coerce_bool(config.get("verify_ssl", True))
+        _coerce_bool(env_ssl, name="OPENSEARCH_VERIFY_SSL") if env_ssl is not None
+        else _coerce_bool(config.get("verify_ssl", True), name="verify_ssl (config.json)")
     )
-    timeout = int(os.environ.get("OPENSEARCH_TIMEOUT", config.get("timeout", 60)))
+    timeout = int(os.environ.get("OPENSEARCH_TIMEOUT", config.get("timeout", DEFAULT_TIMEOUT)))
     max_search_limit = int(
         os.environ.get("OPENSEARCH_MAX_SEARCH_LIMIT", config.get("max_search_limit", MAX_SEARCH_LIMIT))
     )

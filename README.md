@@ -93,9 +93,14 @@ Two things about the `.env` file that bite in practice:
 - **It must be plain `KEY=value`.** `docker --env-file` is not a shell: `export FOO=bar`,
   quoted values and `source` lines are all rejected or taken literally. A `.env` written
   as a shell fragment will fail with a parse error, not a warning.
-- **The Python process does not read it.** It is Docker that turns those lines into
-  environment variables inside the container. On the PyPI and from-source paths, set the
-  variables in your MCP client's `env` block (see step 4) or use `config.json`.
+- **It must be `chmod 600`.** The server refuses to start if any credential file it
+  reads is group- or world-readable. `setup.sh` creates it correctly; if you write it by
+  hand, set the mode yourself.
+
+Both run paths read this file: Docker turns the lines into container environment
+variables via `--env-file`, and the Python process loads it directly. `config.json`
+remains an alternative for the PyPI and from-source paths, and variables set in your MCP
+client's `env` block (step 4) override both.
 
 ### 3a. Docker (recommended)
 
@@ -198,14 +203,27 @@ This is the complete list of variables the code reads. Anything not in this tabl
 | `OPENSEARCH_USERNAME` | `username` | — | Basic auth username |
 | `OPENSEARCH_PASSWORD` | `password` | — | Basic auth password |
 | `OPENSEARCH_VERIFY_SSL` | `verify_ssl` | `true` | Set `false` for self-signed certificates |
-| `OPENSEARCH_TIMEOUT` | `timeout` | `60` | Request timeout in seconds |
+| `OPENSEARCH_TIMEOUT` | `timeout` | `60` | **Total wall-clock budget for one HTTP operation, retries included** — not a per-attempt timeout. A single tool call cannot exceed roughly this (`opensearch_compare` makes two calls, so twice). A legitimately slow query still gets the whole budget on its first attempt |
 | `OPENSEARCH_MAX_SEARCH_LIMIT` | `max_search_limit` | `200` | Cap applied to the search/timeline `limit` parameter. This is a **default, not an absolute** — raising it raises the documented cap |
 | `OPENSEARCH_MAX_HISTOGRAM_BUCKETS` | `max_histogram_buckets` | `2000` | Reject histogram requests exceeding this estimated bucket count. Also a default, not an absolute |
 | `OPENSEARCH_MAX_TERMS_SIZE` | `max_terms_size` | `1000` | Cap applied to the `size` of a terms aggregation. A high-cardinality terms agg loads its whole bucket set into cluster heap, which is the most reliable way to exhaust a coordinating node |
 | `OPENSEARCH_MAX_AGGREGATIONS` | `max_aggregations` | `20` | Cap on how many aggregations one `opensearch_multi_terms` call may run. Aggregations beyond the cap are dropped and named in the response warning, never silently |
-| `OPENSEARCH_ALLOW_INSECURE_CONFIG` | — | unset | Set to `true` to downgrade the `config.json` permission check from a hard failure to a logged warning. Intended for containers and CI where the file mode is not yours to control; it does not make the file safe |
+| `OPENSEARCH_LOG_LEVEL` | — | `WARNING` | `DEBUG`, `INFO`, `WARNING`, `ERROR` or `CRITICAL`. `DEBUG` logs the resolved backend and per-request latency. Logs go to **stderr** — stdout is the MCP transport. An unrecognised value falls back to `WARNING` with a warning rather than failing to start |
+| `OPENSEARCH_ALLOW_INSECURE_CONFIG` | — | unset | Set to `true` to downgrade the credential-file permission check from a hard failure to a logged warning. Intended for containers and CI where the file mode is not yours to control; it does not make the file safe |
 
-The permission gate applies to `config.json` only. `~/.config/mcp-opensearch/.env` is not checked by the server (it never reads it) — `chmod 600` it yourself.
+**The permission gate covers every credential file the process reads** — `config.json`
+and both `.env` paths — and all three must be `chmod 600` or the server refuses to
+start. A world-readable password file is exactly what the check exists for, so the rule
+is the same everywhere rather than strict in one place and absent in another.
+
+Files are read in this order, and a real environment variable always wins over all of
+them:
+
+1. `<checkout>/.env` — development / source-run override
+2. `~/.config/mcp-opensearch/.env` — what `setup.sh` writes; **the Python process does
+   read this** (it did not before, because `load_dotenv()` was called with no path and
+   resolved relative to the installed package rather than to this location)
+3. `~/.config/mcp-opensearch/config.json`
 
 ## Tool Reference
 
@@ -215,6 +233,10 @@ The permission gate applies to `config.json` only. `~/.config/mcp-opensearch/.en
 
 Call first in every session to confirm connectivity and see the active backend. The `username` field immediately explains why certain tools return 403 — it shows exactly which role is authenticated.
 
+**This tool always performs a real probe.** It previously read a cached result, so once the backend had been resolved it did no I/O at all and would report `ok: true` against a cluster that had since died — on the tool whose entire job is answering that question. `ok: true` is now a fact about the moment you asked.
+
+Two consequences worth knowing: it costs one round trip, and because it re-runs the backend preference order it can *change* the active backend mid-session. That is the failover mechanism, but it means the backend is not guaranteed stable across calls.
+
 No parameters.
 
 ```json
@@ -223,7 +245,8 @@ No parameters.
   "backend": "dashboards",
   "version": "2.19.3",
   "url": "https://opensearch.example.com",
-  "username": "myuser"
+  "username": "myuser",
+  "latency_ms": 41
 }
 ```
 

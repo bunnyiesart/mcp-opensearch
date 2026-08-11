@@ -41,6 +41,7 @@ Credentials (env vars or ~/.config/mcp-opensearch/config.json):
 
 import logging
 import os
+import sys
 import threading
 
 from fastmcp import FastMCP
@@ -48,14 +49,33 @@ from fastmcp import FastMCP
 from lib.client import init_client
 from lib.compare import compare_windows
 
-# Configure only this server's logger, never the root logger. basicConfig() on
-# the root at import time silenced lib.client's INFO lines — including the only
-# two that say which backend was selected — which left an operator debugging a
-# backend problem with no log and no latency data. Level is settable so that
-# debugging does not require editing the source.
-_LOG_LEVEL = os.environ.get("OPENSEARCH_LOG_LEVEL", "WARNING").upper()
-logging.basicConfig(level=getattr(logging, _LOG_LEVEL, logging.WARNING))
+# Logging must go to stderr, never stdout: stdout IS the MCP stdio transport, so a
+# single log line written there corrupts the JSON-RPC stream and the client sees a
+# protocol error rather than a log message.
+#
+# The level is settable because it used to be hardcoded to WARNING on the ROOT
+# logger, which silenced lib.client's INFO lines — including the only two that
+# report which backend was selected. An operator debugging a backend problem had
+# neither a log line nor any latency figure. lib.client lifts its own logger out of
+# a WARNING root independently; this governs the rest of the process.
+# An unrecognised level falls back rather than raising: basicConfig(level="NOPE")
+# throws ValueError, and here that would abort import and stop the server booting.
+# An MCP startup failure surfaces only as "server failed to start", so a typo in a
+# logging knob must never be able to cause one.
+_REQUESTED_LEVEL = os.environ.get("OPENSEARCH_LOG_LEVEL", "WARNING").strip().upper()
+_LEVEL = getattr(logging, _REQUESTED_LEVEL, None)
+logging.basicConfig(
+    level=_LEVEL if isinstance(_LEVEL, int) else logging.WARNING,
+    stream=sys.stderr,
+    format="%(levelname)s %(name)s: %(message)s",
+)
 logger = logging.getLogger("opensearch-mcp")
+if not isinstance(_LEVEL, int):
+    logger.warning(
+        "OPENSEARCH_LOG_LEVEL=%r is not a valid level; using WARNING. "
+        "Valid values: DEBUG, INFO, WARNING, ERROR, CRITICAL.",
+        _REQUESTED_LEVEL,
+    )
 
 mcp = FastMCP("opensearch")
 

@@ -61,28 +61,38 @@ def test_no_method_issues_a_request_without_passing_check_path():
         "_get",                  # calls _check_path first
         "_post",                 # calls _check_path first
         "_dashboards_proxy",     # reached only from _get/_post, path already checked
-        "_resolve_backend",      # two literal probe URLs, no caller input
+        "_probe",                # literal probe URLs during backend resolution
         "list_index_patterns",   # two literal Dashboards endpoints, no caller input
     }
     tree = _tree(CLIENT)
-    offenders = {}
+    offenders, total = {}, 0
     for fn in _functions(tree):
         for node in ast.walk(fn):
-            if not isinstance(node, ast.Call):
-                continue
-            f = node.func
+            # Match the ATTRIBUTE, not a Call whose func is the attribute. An earlier
+            # version of this check only looked at ast.Call, and a refactor that passed
+            # `self._session.get` as a callable into a helper made the pattern match
+            # nothing at all — so the check passed while no longer checking anything.
+            # A security assertion that can go vacuous is worse than none, because it
+            # reports safety it is not verifying.
             if (
-                isinstance(f, ast.Attribute)
-                and f.attr in {"get", "post", "request"}
-                and isinstance(f.value, ast.Attribute)
-                and f.value.attr == "_session"
-                and fn.name not in permitted
+                isinstance(node, ast.Attribute)
+                and node.attr in {"get", "post", "request", "send"}
+                and isinstance(node.value, ast.Attribute)
+                and node.value.attr == "_session"
             ):
-                offenders[fn.name] = offenders.get(fn.name, 0) + 1
+                total += 1
+                if fn.name not in permitted:
+                    offenders[fn.name] = offenders.get(fn.name, 0) + 1
+
+    assert total, (
+        "this check found no references to self._session at all, which means the "
+        "pattern it matches no longer describes how requests are issued — so it is "
+        "silently verifying nothing. Update the matcher before trusting it again."
+    )
     assert not offenders, (
-        f"these functions issue HTTP directly without passing _check_path: {offenders}. "
+        f"these functions reach the HTTP session without passing _check_path: {offenders}. "
         "Route them through _get/_post, or add them to `permitted` with a justification "
-        "if the path is a fixed literal."
+        "if the path is a fixed literal with no caller input."
     )
 
 

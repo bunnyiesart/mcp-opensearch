@@ -5,13 +5,14 @@
 # supported run paths read configuration in different ways:
 #
 #   config.json  — read by the Python process (PyPI install or `python3 server.py`).
-#   .env         — read by `docker --env-file` (and therefore by `make run` /
-#                  `make shell` and the documented `docker run` command). It must
-#                  be plain KEY=value: docker cannot parse shell syntax, so no
-#                  `export`, no quoting, no `source` lines. The Python process
-#                  does NOT read this file — Docker turns it into real env vars.
+#   .env         — read by BOTH paths: `docker --env-file` (and therefore `make run`
+#                  / `make shell` and the documented `docker run` command), and the
+#                  Python process, which loads this exact path explicitly. It must
+#                  be plain KEY=value regardless: docker cannot parse shell syntax,
+#                  so no `export`, no quoting, no `source` lines.
 #
-# Both files contain the password, so both are created under `umask 077`.
+# Both files contain the password, so both are created under `umask 077`. The server
+# refuses to start if either is group- or world-readable, so the mode is not optional.
 
 set -e
 
@@ -145,10 +146,11 @@ chmod 600 "$ENV_FILE"
 
 echo "Saved (both chmod 600):"
 echo "  $CONFIG_FILE  — used by the Python paths (pip install / python3 server.py)"
-echo "  $ENV_FILE     — used by the Docker path (docker --env-file, make run, make shell)"
+echo "  $ENV_FILE     — used by BOTH paths (docker --env-file, and loaded directly"
+echo "                    by the Python process)"
 echo ""
-echo "Note: the Python process does not read $ENV_FILE itself. It is Docker that"
-echo "turns those lines into environment variables inside the container."
+echo "Keep both at mode 600. The server refuses to start if a credential file it"
+echo "reads is group- or world-readable."
 echo ""
 echo "Next steps:"
 echo "  Docker:  make -C $(dirname "$0") build && make -C $(dirname "$0") run"

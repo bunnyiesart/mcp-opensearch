@@ -43,7 +43,27 @@ get right on the first try.
 
 **We will probe OpenSearch Dashboards first via `/api/status`, and fall back to
 the direct OpenSearch REST API when Dashboards is absent, unreachable, or refuses
-the probe. The resolved backend is cached on the client for the process lifetime.**
+the probe. The resolved backend is cached, subject to a re-resolution policy.**
+
+> **Amended 10 Aug 2026.** This decision originally read "cached on the client for
+> the process lifetime", and the Consequences below recorded the resulting
+> diagnosability and permanence costs as accepted. Both were then fixed rather than
+> merely tolerated, so the original text is preserved here for the record and the
+> current behaviour is described below. The *decision* — Dashboards first, direct as
+> fallback — is unchanged, so this is an amendment rather than a superseding ADR.
+
+The caching policy, as built:
+
+- The **preferred** backend, once active, is not re-probed on a schedule. A probe
+  before every request would add a round trip to everything in order to detect a
+  failure that the request itself already reports.
+- A **degraded** resolution — Dashboards configured but direct won — is re-probed
+  after `backend_recheck_seconds` (default 300), so a Dashboards blip heals within
+  five minutes at a cost of at most one extra round trip per window.
+- A **transport failure drops the cache immediately**, so failover in either
+  direction costs one probe on the next call.
+- `opensearch_test` and `list_index_patterns` force a probe, because answering
+  "which backend is active, and is it alive?" is precisely what they are for.
 
 Corollaries, all currently true in the code:
 
@@ -77,21 +97,28 @@ credentials still function. The active backend is always observable through
 
 **Negative, accepted:**
 
-- **Diagnosis is harder, and this is the real cost.** The probe swallows the
+- ~~**Diagnosis is harder, and this is the real cost.** The probe swallows the
   distinction between "Dashboards said 401", "TLS verification failed" and
-  "Dashboards is not there". When neither backend resolves, the final error names
-  the two environment variables, which can misdescribe a cause that was actually
-  authentication or certificate validation. Warnings are logged, but the raised
-  error is the thing an agent sees.
+  "Dashboards is not there"…~~ **Resolved 10 Aug 2026.** The raised error now lists
+  each backend attempted with its real cause — auth failed, TLS verification failed,
+  unreachable, redirected to SSO, non-JSON login page, or an HTTP status — and
+  mentions `OPENSEARCH_URL` only when it was actually set, or says explicitly that
+  it was not set so no fallback was attempted.
 - The proxy path is not semantically identical to a direct call. A GET routed
   through `/api/console/proxy` is delivered as a POST to Dashboards with the real
   method as a parameter, and query parameters are flattened into the proxied path
   string. This is a second code path with its own encoding behaviour, and it is
-  exercised only against a live Dashboards.
-- Backend resolution is cached, so a backend that recovers mid-session is not
-  re-probed.
+  exercised only against a live Dashboards. **Partially reduced:** proxied GETs no
+  longer carry a `{}` body, so that particular asymmetry between the two backends is
+  gone. The separate code path, and the fact that its encoding is unverified against
+  a real Dashboards + OpenSearch pair, both remain.
+- ~~Backend resolution is cached, so a backend that recovers mid-session is not
+  re-probed.~~ **Resolved 10 Aug 2026** — see the caching policy in the Decision
+  above. A degraded resolution is re-probed on a timer and a transport failure drops
+  the cache immediately, so recovery and failover both work in either direction.
 - `init_client` probes eagerly at startup, so process launch depends on cluster
-  reachability.
+  reachability. **Still true**, and still accepted: paying the probe once at launch
+  surfaces a configuration error immediately rather than on the first tool call.
 
 **Trade-off taken:** we trade diagnosability and a single clean request path for
 usability against restricted credentials, because a server that a firewalled
@@ -100,18 +127,23 @@ look.
 
 ## Compliance
 
-- Automatable? **Partly.**
-- Mechanism: unit tests over the resolution logic with both probes stubbed —
-  Dashboards 200, Dashboards 401, Dashboards unreachable, only-direct configured,
-  only-Dashboards configured, neither configured — asserting both the chosen
-  backend and that the raised message names the real cause. The proxy encoding
-  behaviour needs an integration test against a container; until that exists this
-  half is **manual and hereby recorded as such** rather than quietly unverified.
-- Where the check lives: `tests/` (resolution); proxy encoding currently unverified.
-- When it runs: CI for the unit half.
-- Code changes needed to make it measurable: the two broad `except Exception`
-  blocks in `_resolve_backend` need to preserve enough of the cause to assert on,
-  which is the same change that fixes the misleading-error consequence above.
+- Automatable? **Partly** — and the automated half now exists.
+- Mechanism: unit tests over the resolution logic with the probes stubbed, asserting
+  both the chosen backend and that the raised message names the real cause. The
+  matrix is broader than this section originally specified and now covers Dashboards
+  200 / 401 / 403 / 302-to-SSO / HTML login page / unreachable / TLS failure, plus
+  only-direct, only-Dashboards and neither-configured. The proxy **encoding**
+  behaviour still needs an integration test against a live Dashboards + OpenSearch
+  pair; until that exists that half is **manual and recorded as such** rather than
+  quietly unverified.
+- Where the check lives: `tests/test_resilience.py` (resolution, failover,
+  re-probe policy); proxy encoding still unverified.
+- When it runs: CI, every push and pull request, for the automated half.
+- ~~Code changes needed to make it measurable: the two broad `except Exception`
+  blocks in `_resolve_backend` need to preserve enough of the cause to assert on…~~
+  **Done 10 Aug 2026.** `_resolve_backend` was replaced by `_candidates()` /
+  `_probe()` / `_resolution_error()`, which classify each failure instead of
+  discarding it, and a `session=None` constructor parameter provides the test seam.
 
 ## Notes
 
