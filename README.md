@@ -402,7 +402,16 @@ Full-document retrieval using Lucene syntax — the same syntax as the OpenSearc
 }
 ```
 
-`warning` is present when the `limit` was capped or no time range was given.
+`warning` is present when the `limit` was capped, no time range was given, or **`total`
+is a lower bound rather than an exact count**.
+
+That last case matters more than it looks. OpenSearch stops counting at
+`track_total_hits` — 10,000 by default — and reports `hits.total.relation: "gte"` to say
+"at least this many". Measured on a live cluster, a wildcard search returned
+`total: 10000` where the true figure was **33,645,389**. When the count is truncated the
+warning says so explicitly and points you at
+[`opensearch_count`](#opensearch_count), which is not subject to the cap. If you need an
+exact figure, use `opensearch_count` — `opensearch_search`'s `total` is a floor.
 
 `ids[i]` is the OpenSearch `_id` of `hits[i]` — the two lists are index-aligned and always the
 same length. This is how you obtain a `doc_id` for [`opensearch_explain`](#opensearch_explain);

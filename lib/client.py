@@ -266,6 +266,31 @@ def _val(data, key: str, default=None):
     return default if value is None else value
 
 
+def _normalise_total(hits) -> tuple:
+    """Extract a hit total. Returns (total, is_exact).
+
+    `hits.total` is `{"value": N, "relation": "eq"|"gte"}` on modern OpenSearch and a
+    bare int on very old versions. **`relation` is load-bearing and was being
+    discarded.** OpenSearch stops counting at `track_total_hits` — 10,000 by default
+    — and reports `"gte"` to say "at least this many". Returning that value alone
+    turns a floor into an apparent exact count: verified against a live cluster,
+    a wildcard search reported 10,000 where the true figure was 33,645,389.
+
+    Post-condition: `total` is a number; `is_exact` is False only when OpenSearch
+    explicitly said the count was truncated.
+    """
+    total = _val(hits, "total", 0)
+    if isinstance(total, dict):
+        value = _val(total, "value", 0)
+        relation = _val(total, "relation", "eq")
+        if not isinstance(value, (int, float)):
+            return 0, True
+        return value, relation != "gte"
+    if isinstance(total, (int, float)):
+        return total, True
+    return 0, True
+
+
 def _items(data, key: str) -> list:
     """The list at `data[key]`, or [] when it is absent, null or not a list."""
     value = data.get(key) if isinstance(data, dict) else None
@@ -1256,12 +1281,20 @@ class OpenSearchClient:
             body["_source"] = source_fields
         result = self._post(f"/{index}/_search", body=body)
         hits = _dig(result, "hits")
-        total = _val(hits, "total", 0)
-        if isinstance(total, dict):
-            total = _val(total, "value", 0)
-        elif not isinstance(total, (int, float)):
-            total = 0
+        total, total_is_exact = _normalise_total(hits)
         warnings = []
+        if not total_is_exact:
+            # OpenSearch stops counting at track_total_hits (10,000 by default) and
+            # says so via hits.total.relation == "gte". Discarding that turned a
+            # floor into an apparent total: measured on a live cluster, this
+            # reported 10,000 against a true 33,645,389 — a 3,364x under-report on
+            # the question "how many events match?". The agent has no way to tell
+            # unless we say so, and opensearch_count is not subject to the cap.
+            warnings.append(
+                f"total is a LOWER BOUND, not an exact count: at least {total:,} "
+                "documents match. OpenSearch stopped counting at its "
+                "track_total_hits limit. Use opensearch_count for the exact figure."
+            )
         if capped < limit:
             warnings.append(
                 f"limit capped at {capped} (requested {limit}). "
@@ -1976,9 +2009,7 @@ class OpenSearchClient:
             "/_plugins/_anomaly_detection/detectors/results/_search", body=body
         )
         hits = _dig(result, "hits")
-        total = _val(hits, "total", 0)
-        if isinstance(total, dict):
-            total = _val(total, "value", 0)
+        total, total_is_exact = _normalise_total(hits)
         anomalies = [
             {
                 "detector_id": _val(_dig(h, "_source"), "detector_id"),
@@ -1990,6 +2021,12 @@ class OpenSearchClient:
             for h in _items(hits, "hits")
         ]
         warnings = [w for w in (size_warning,) if w]
+        if not total_is_exact:
+            warnings.append(
+                f"total is a LOWER BOUND, not an exact count: at least {total:,} "
+                "anomaly results match. OpenSearch stopped counting at its "
+                "track_total_hits limit."
+            )
         if not from_ts and not to_ts:
             warnings.append(_NO_TIME_RANGE_WARNING)
         out = {"total": total}

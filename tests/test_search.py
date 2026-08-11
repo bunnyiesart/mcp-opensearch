@@ -354,3 +354,49 @@ def test_discover_fields_warning_key_collides_with_a_real_field_named_warning(
     stub(search_response(hits=[{"_warning": "from the document"}]))
     result = client.discover_fields("idx", sample_size=MAX_SAMPLE_SIZE + 1, **BOUNDED)
     assert result["_warning"].startswith("sample_size capped")
+
+
+# ── hits.total.relation: exact count vs lower bound ───────────────────────────
+
+
+def test_truncated_total_is_reported_as_a_lower_bound(client, stub):
+    """`hits.total.relation == "gte"` means OpenSearch stopped counting.
+
+    Found by running against a live cluster, not by any unit test: a wildcard search
+    reported `total: 10000` where `opensearch_count` returned 33,645,389 — a 3,364x
+    under-report on the question "how many events match?". OpenSearch stops counting
+    at `track_total_hits` (10,000 by default) and says so via `relation`, which the
+    code discarded, turning a floor into an apparent exact count.
+
+    Every stub in this suite emitted `relation: "eq"`, which is exactly why the defect
+    was invisible here — the fixtures only ever described the case that worked.
+    """
+    stub({"hits": {"total": {"value": 10000, "relation": "gte"}, "hits": []}})
+    out = client.search_string("idx", **BOUNDED)
+    assert out["total"] == 10000
+    assert "LOWER BOUND" in out["warning"]
+    assert "opensearch_count" in out["warning"]
+
+
+def test_exact_total_carries_no_lower_bound_warning(client, stub):
+    """The other side of the boundary: `relation: "eq"` is an exact count, and
+    warning about it would train the caller to ignore the warning."""
+    stub({"hits": {"total": {"value": 42, "relation": "eq"}, "hits": []}})
+    out = client.search_string("idx", **BOUNDED)
+    assert out["total"] == 42
+    assert "warning" not in out
+
+
+def test_missing_relation_is_treated_as_exact(client, stub):
+    """Absent `relation` means an older OpenSearch that did not truncate. Assuming
+    the pessimistic case would warn on every response from such a cluster."""
+    stub({"hits": {"total": {"value": 7}, "hits": []}})
+    assert "warning" not in client.search_string("idx", **BOUNDED)
+
+
+def test_flat_integer_total_is_treated_as_exact(client, stub):
+    """Pre-7.0 clusters send a bare integer, which has no truncation concept."""
+    stub(search_response(hits=[{"a": 1}], total=5, total_as_int=True))
+    out = client.search_string("idx", **BOUNDED)
+    assert out["total"] == 5
+    assert "warning" not in out
