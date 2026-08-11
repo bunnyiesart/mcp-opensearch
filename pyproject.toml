@@ -29,6 +29,12 @@ dependencies = [
     "urllib3>=2.0,<3",
 ]
 
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.6",
+]
+
 [project.urls]
 Homepage = "https://github.com/bunnyiesart/mcp-opensearch"
 Repository = "https://github.com/bunnyiesart/mcp-opensearch"
@@ -39,3 +45,62 @@ mcp-opensearch = "server:main"
 
 [tool.hatch.build.targets.wheel]
 include = ["server.py", "lib/"]
+
+[tool.ruff]
+# Pinned deliberately. Before this section existed, CI ran a bare `ruff check .`,
+# so the rule set was whatever that release of ruff happened to default to — and
+# when those defaults broadened (RUF013, UP045, BLE001, SIM102 joined them), the
+# job went red without a line of this project's code changing. A check whose
+# meaning drifts under you is not a governance mechanism. The rule set and the
+# ruff version (see [project.optional-dependencies] dev and the CI lint job) are
+# both pinned so a lint failure always means "the code changed", never "the tool
+# changed".
+line-length = 120
+target-version = "py310"   # must track requires-python
+
+[tool.ruff.lint]
+select = [
+    "E", "W",   # pycodestyle
+    "F",        # pyflakes
+    "I",        # import ordering
+    "UP",       # pyupgrade — keeps syntax at the declared floor
+    "B",        # bugbear — real bug patterns, not style
+    "SIM",      # simplification
+    "RUF",      # ruff-specific
+    "C90",      # mccabe complexity — see below
+]
+ignore = [
+    # Ambiguous-unicode checks on prose. The en dashes and multiplication signs
+    # in tool docstrings are deliberate typography in text an LLM reads, not
+    # accidental homoglyphs in code. RUF001 (the code equivalent) stays enabled.
+    "RUF002",
+]
+
+[tool.ruff.lint.per-file-ignores]
+# The @mcp.prompt() functions in server.py return multi-line f-strings whose
+# content is a prompt an LLM reads, including ready-to-run tool calls with their
+# full argument lists. Those example lines exceed 120 characters, and there is no
+# way to silence them: `# noqa` cannot appear inside a string literal, and
+# wrapping them would insert newlines into the prompt payload, splitting a tool
+# call mid-argument. So this is a deliberate, recorded exception rather than an
+# unexamined one — E501 stays enforced everywhere else, including lib/.
+"server.py" = ["E501"]
+
+[tool.ruff.lint.mccabe]
+# Doc 07 §5 asks for complexity to be monitored with a threshold decided on
+# purpose. Measured before choosing: this codebase has zero functions above
+# complexity 8, so 10 is not a target to work toward — it is a ratchet that locks
+# in the current well-factored state and fails the build if a function starts
+# growing branches. The industry-suggested ceiling is 10; the stricter 5 that
+# Fundamentals prefers would flag nothing today either, but 10 leaves room for
+# the genuinely branchy response-shaping code without inviting a rewrite.
+max-complexity = 10
+
+[tool.pytest.ini_options]
+minversion = "8.0"
+testpaths = ["tests"]
+addopts = "-q --strict-markers --strict-config"
+# An xfail that starts passing is a signal, not noise: it means the bug it
+# documents has been fixed and the marker must be removed. Fail loudly on XPASS
+# so known-bug tests cannot silently rot into permanent exemptions.
+xfail_strict = true

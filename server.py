@@ -16,7 +16,7 @@ Exposes:
   opensearch_histogram           — temporal event count histogram
   opensearch_stats               — numeric stats for a field
   opensearch_ppl                 — PPL (Piped Processing Language) query
-  opensearch_api                 — escape hatch: any read GET endpoint
+  opensearch_api                 — escape hatch: allowlisted read GET endpoints
   opensearch_explain             — explain why a document matches a query
   opensearch_index_settings      — shard count, replicas, ILM policy, refresh interval
   opensearch_list_monitors       — list Alerting-plugin monitors (detection rules)
@@ -40,35 +40,69 @@ Credentials (env vars or ~/.config/mcp-opensearch/config.json):
 """
 
 import logging
-import re
-from typing import Optional
+import os
+import sys
+import threading
 
 from fastmcp import FastMCP
 
 from lib.client import init_client
+from lib.compare import compare_windows
 
-logging.basicConfig(level=logging.WARNING)
+# Logging must go to stderr, never stdout: stdout IS the MCP stdio transport, so a
+# single log line written there corrupts the JSON-RPC stream and the client sees a
+# protocol error rather than a log message.
+#
+# The level is settable because it used to be hardcoded to WARNING on the ROOT
+# logger, which silenced lib.client's INFO lines — including the only two that
+# report which backend was selected. An operator debugging a backend problem had
+# neither a log line nor any latency figure. lib.client lifts its own logger out of
+# a WARNING root independently; this governs the rest of the process.
+# An unrecognised level falls back rather than raising: basicConfig(level="NOPE")
+# throws ValueError, and here that would abort import and stop the server booting.
+# An MCP startup failure surfaces only as "server failed to start", so a typo in a
+# logging knob must never be able to cause one.
+_REQUESTED_LEVEL = os.environ.get("OPENSEARCH_LOG_LEVEL", "WARNING").strip().upper()
+_LEVEL = getattr(logging, _REQUESTED_LEVEL, None)
+logging.basicConfig(
+    level=_LEVEL if isinstance(_LEVEL, int) else logging.WARNING,
+    stream=sys.stderr,
+    format="%(levelname)s %(name)s: %(message)s",
+)
 logger = logging.getLogger("opensearch-mcp")
+if not isinstance(_LEVEL, int):
+    logger.warning(
+        "OPENSEARCH_LOG_LEVEL=%r is not a valid level; using WARNING. "
+        "Valid values: DEBUG, INFO, WARNING, ERROR, CRITICAL.",
+        _REQUESTED_LEVEL,
+    )
 
 mcp = FastMCP("opensearch")
 
-# Path fragments that indicate write or admin operations — blocked by opensearch_api
-_WRITE_PATH_FRAGMENTS = frozenset([
-    "_delete", "_close", "_bulk", "_update", "_create",
-    "_reindex", "_rollover", "_shrink", "_split", "_clone",
-    "_open", "_freeze", "_unfreeze", "_forcemerge",
-])
-
-# Validates /{index}/_explain/{doc_id} paths for opensearch_explain
-_EXPLAIN_PATH_RE = re.compile(r"^/[^/]+/_explain/[^/]+$")
+# No path guards live in this file. Read-only enforcement is the client's job:
+# lib.client._ALLOWED_PATHS is the single allowlist and every request passes
+# through OpenSearchClient._check_path, which raises PermissionError with the
+# allowed paths in the message. Tools here stay thin delegates.
 
 _client = None
+_client_lock = threading.Lock()
 
 
 def get_client():
+    """The shared client, built once.
+
+    FastMCP dispatches synchronous tool functions on a worker thread pool, so the
+    plain `if _client is None` check-then-assign was a race: two concurrent first
+    calls both saw None, both paid the backend probe, and one of the two
+    `requests.Session` objects was silently orphaned. Double-checked locking keeps
+    the fast path lock-free after initialisation while making the first call
+    exactly-once.
+    """
     global _client
     if _client is None:
-        _client = init_client()
+        with _client_lock:
+            if _client is None:          # re-check: another thread may have won
+                _client = init_client()
     return _client
 
 
@@ -140,8 +174,8 @@ def opensearch_get_mapping(index: str) -> dict:
 def opensearch_discover_fields(
     index: str,
     query_string: str = "*",
-    from_ts: Optional[str] = None,
-    to_ts: Optional[str] = None,
+    from_ts: str | None = None,
+    to_ts: str | None = None,
     ts_field: str = "@timestamp",
     sample_size: int = 10,
 ) -> dict:
@@ -178,20 +212,21 @@ def opensearch_discover_fields(
 def opensearch_search(
     index: str,
     query_string: str = "*",
-    from_ts: Optional[str] = None,
-    to_ts: Optional[str] = None,
+    from_ts: str | None = None,
+    to_ts: str | None = None,
     ts_field: str = "@timestamp",
     limit: int = 50,
     offset: int = 0,
-    sort_field: Optional[str] = None,
+    sort_field: str | None = None,
     sort_dir: str = "desc",
-    source_fields: Optional[list] = None,
+    source_fields: list | None = None,
 ) -> dict:
     """Full-document retrieval using Lucene syntax (same as the Dashboards search bar).
 
-    Always pass source_fields to limit response size — 50 full docs ≈ 237 KB and will
-    fill context quickly. Omitting from_ts/to_ts scans the full index history, which is
-    slow and expensive; adding a time range reduces query time by up to 15×.
+    Always pass source_fields — full documents in security indices are large, so an
+    unrestricted response consumes a large share of context. Omitting from_ts/to_ts
+    scans the full index history; a time range lets OpenSearch skip shards and
+    segments outside it and is usually much faster.
 
     Args:
         index: Index name or wildcard pattern, e.g. "wazuh-alerts-*".
@@ -202,7 +237,8 @@ def opensearch_search(
         from_ts: Start time, UTC ISO 8601, e.g. "2026-06-23T00:00:00Z".
         to_ts: End time, UTC ISO 8601, e.g. "2026-06-24T00:00:00Z".
         ts_field: Timestamp field name (default "@timestamp").
-        limit: Max documents to return (default 50, hard cap 200).
+        limit: Max documents to return (default 50, capped at 200 by default —
+               see OPENSEARCH_MAX_SEARCH_LIMIT).
         offset: Pagination offset — skip this many documents before returning
                 results (default 0). Increment by limit to page: offset=0 → page 1,
                 offset=50 → page 2, etc.
@@ -230,14 +266,15 @@ def opensearch_search(
 def opensearch_count(
     index: str,
     query_string: str = "*",
-    from_ts: Optional[str] = None,
-    to_ts: Optional[str] = None,
+    from_ts: str | None = None,
+    to_ts: str | None = None,
     ts_field: str = "@timestamp",
 ) -> dict:
     """Fastest way to check how many documents match a condition; never returns content.
 
     Prefer over opensearch_search when you only need the count — it never fills context
-    with document data. Without from_ts/to_ts, scans the full index (4–5 s on 50 M docs).
+    with document data. Without from_ts/to_ts, scans the full index, which can be slow
+    on a large one.
 
     Args:
         index: Index name or wildcard pattern.
@@ -263,12 +300,12 @@ def opensearch_timeline(
     index: str,
     entity: str,
     fields: list,
-    from_ts: Optional[str] = None,
-    to_ts: Optional[str] = None,
+    from_ts: str | None = None,
+    to_ts: str | None = None,
     ts_field: str = "@timestamp",
     limit: int = 100,
-    source_fields: Optional[list] = None,
-    extra_query: Optional[str] = None,
+    source_fields: list | None = None,
+    extra_query: str | None = None,
 ) -> dict:
     """Build a chronological event timeline for a single entity (IP, user, host) across fields.
 
@@ -285,7 +322,8 @@ def opensearch_timeline(
         from_ts: Start time, UTC ISO 8601, e.g. "2026-06-23T00:00:00Z".
         to_ts: End time, UTC ISO 8601.
         ts_field: Timestamp field name (default "@timestamp").
-        limit: Max events to return, oldest-first (default 100, hard cap 200).
+        limit: Max events to return, oldest-first (default 100, capped at 200 by
+               default — see OPENSEARCH_MAX_SEARCH_LIMIT).
         source_fields: Fields to include per event — strongly recommended, e.g.
                        ["@timestamp", "rule.description", "rule.level", "data.srcip", "data.dstip"].
         extra_query: Optional Lucene filter ANDed with the entity match,
@@ -314,8 +352,8 @@ def opensearch_terms(
     index: str,
     field: str,
     query_string: str = "*",
-    from_ts: Optional[str] = None,
-    to_ts: Optional[str] = None,
+    from_ts: str | None = None,
+    to_ts: str | None = None,
     ts_field: str = "@timestamp",
     size: int = 50,
 ) -> dict:
@@ -353,8 +391,8 @@ def opensearch_multi_terms(
     index: str,
     aggregations: list,
     query_string: str = "*",
-    from_ts: Optional[str] = None,
-    to_ts: Optional[str] = None,
+    from_ts: str | None = None,
+    to_ts: str | None = None,
     ts_field: str = "@timestamp",
 ) -> dict:
     """Preferred over calling opensearch_terms in a loop — single round-trip for multiple fields.
@@ -430,8 +468,8 @@ def opensearch_stats(
     index: str,
     field: str,
     query_string: str = "*",
-    from_ts: Optional[str] = None,
-    to_ts: Optional[str] = None,
+    from_ts: str | None = None,
+    to_ts: str | None = None,
     ts_field: str = "@timestamp",
 ) -> dict:
     """Min/max/avg/std for a numeric field. Only works on numeric types (integer, float, long).
@@ -492,17 +530,22 @@ def opensearch_ppl(query: str) -> dict:
 
 @mcp.tool()
 def opensearch_api(path: str) -> dict:
-    """Escape hatch for any read GET endpoint not covered by other tools.
+    """Escape hatch for read GET endpoints not covered by other tools.
 
     Use when you know the OpenSearch REST path but no dedicated tool exists.
     For search/count/terms/histogram use the dedicated tools — they add safety
-    guards and better error messages. Only GET is supported; write/admin paths
-    (_delete, _bulk, _update, _reindex, etc.) are blocked.
+    guards and better error messages. Only GET is supported, and only paths on
+    the server's read-only allowlist: anything else is refused with a message
+    listing what is available. Endpoints that could expose credentials (the
+    security plugin, snapshot repositories, cluster settings) are never
+    reachable, whatever their HTTP method.
 
     Examples of valid paths:
         /_nodes/stats
         /_cat/plugins?format=json
         /_plugins/_ism/policies
+        /_plugins/_ism/policies/hot_rollover_policy
+        /_cat/indices/my-index-name
         /my-index/_alias
         /my-index/_shard_stores
 
@@ -513,15 +556,7 @@ def opensearch_api(path: str) -> dict:
         Raw JSON response from OpenSearch. Endpoints that return a JSON array
         (e.g. the _cat/* APIs) are wrapped as {"result": [...]}.
     """
-    if not path.startswith("/"):
-        raise ValueError(f"path must start with '/'. Got: {path!r}")
-    hits = [f for f in _WRITE_PATH_FRAGMENTS if f in path.lower()]
-    if hits:
-        raise ValueError(
-            f"Path {path!r} contains restricted keyword(s) {hits} — "
-            "only read endpoints are permitted."
-        )
-    result = get_client().raw_get(path)
+    result = get_client().api_get(path)
     # FastMCP requires structured output to be a dict; wrap array responses
     # (e.g. /_cat/* endpoints) so they don't fail serialization.
     if not isinstance(result, dict):
@@ -537,25 +572,22 @@ def opensearch_explain(
 ) -> dict:
     """Explain why a specific document matches (or doesn't match) a query.
 
-    Use after opensearch_search returns unexpected results and you have a known
-    document ID. Get the doc ID from a prior search by including "_id" in
-    source_fields (note: _id is a metadata field — use opensearch_search and
-    read the _id from hits). Exact index name only — no wildcards.
+    Use after opensearch_search returns unexpected results and you have a document
+    ID. Take doc_id from the "ids" list that opensearch_search and
+    opensearch_timeline return: ids[i] is the _id of hits[i], index-aligned and
+    always the same length. Do NOT try to request "_id" via source_fields — _id is
+    document metadata, not a _source field, so that returns nothing.
+
+    Exact index name only — no wildcards.
 
     Args:
-        index: Exact index name, e.g. "wazuh-alerts-4.x-2026.06.24".
-        doc_id: Document _id as returned by a prior search.
+        index: Exact index name, e.g. "wazuh-alerts-4.x-2026.06.24". No "/".
+        doc_id: Document _id, taken from the "ids" list of a prior search. No "/".
         query_string: Lucene query to evaluate against the document (default "*").
 
     Returns:
         {"matched": bool, "explanation": {...score breakdown...}}
     """
-    path = f"/{index}/_explain/{doc_id}"
-    if not _EXPLAIN_PATH_RE.match(path):
-        raise ValueError(
-            f"Invalid explain path {path!r}. "
-            "index must not contain '/' and doc_id must not be empty."
-        )
     query = {"query_string": {"query": query_string, "analyze_wildcard": True}}
     return get_client().explain(index, doc_id, query)
 
@@ -601,8 +633,8 @@ def opensearch_list_monitors(size: int = 50) -> list:
 
 @mcp.tool()
 def opensearch_get_alerts(
-    state: Optional[str] = None,
-    monitor_id: Optional[str] = None,
+    state: str | None = None,
+    monitor_id: str | None = None,
     size: int = 50,
 ) -> dict:
     """Fetch alerts raised by Alerting-plugin monitors — the "what is firing right now?" tool.
@@ -644,9 +676,9 @@ def opensearch_list_detectors(size: int = 50) -> list:
 
 @mcp.tool()
 def opensearch_get_anomaly_results(
-    detector_id: Optional[str] = None,
-    from_ts: Optional[str] = None,
-    to_ts: Optional[str] = None,
+    detector_id: str | None = None,
+    from_ts: str | None = None,
+    to_ts: str | None = None,
     min_grade: float = 0.0,
     size: int = 50,
 ) -> dict:
@@ -718,43 +750,10 @@ def opensearch_compare(
         }
     """
     client = get_client()
-    baseline = client.terms(
-        index, field,
-        query_string=query_string,
-        from_ts=baseline_from, to_ts=baseline_to,
-        ts_field=ts_field, size=size,
-    )
-    selection = client.terms(
-        index, field,
-        query_string=query_string,
-        from_ts=selection_from, to_ts=selection_to,
-        ts_field=ts_field, size=size,
-    )
-    b_warn = baseline.pop("_warning", None)
-    s_warn = selection.pop("_warning", None)
-
-    all_keys = set(baseline) | set(selection)
-    added, removed, changed, unchanged = {}, {}, {}, {}
-    for k in all_keys:
-        b, s = baseline.get(k), selection.get(k)
-        if b is None:
-            added[k] = s
-        elif s is None:
-            removed[k] = b
-        elif b != s:
-            pct = round((s - b) / b * 100, 1) if b else None
-            changed[k] = {"baseline": b, "selection": s, "delta": s - b, "pct_change": pct}
-        else:
-            unchanged[k] = {"baseline": b, "selection": s}
-
-    return {
-        "added":    added,
-        "removed":  removed,
-        "changed":  dict(sorted(changed.items(), key=lambda x: abs(x[1]["delta"]), reverse=True)),
-        "unchanged": unchanged,
-        "baseline_warning":  b_warn,
-        "selection_warning": s_warn,
-    }
+    window = dict(query_string=query_string, ts_field=ts_field, size=size)
+    baseline = client.terms(index, field, from_ts=baseline_from, to_ts=baseline_to, **window)
+    selection = client.terms(index, field, from_ts=selection_from, to_ts=selection_to, **window)
+    return compare_windows(baseline, selection)
 
 
 # ── Prompts ───────────────────────────────────────────────────────────────────
