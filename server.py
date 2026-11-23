@@ -37,9 +37,15 @@ Credentials (env vars or ~/.config/mcp-opensearch/config.json):
   OPENSEARCH_USERNAME
   OPENSEARCH_PASSWORD
   OPENSEARCH_VERIFY_SSL      — "true"/"false" (default: true)
+
+Transport (env vars):
+  MCP_TRANSPORT              — "stdio" (default) or "http" (streamable-HTTP)
+  MCP_HTTP_HOST              — HTTP bind host (default: 127.0.0.1)
+  MCP_HTTP_PORT              — HTTP bind port (default: 8080)
 """
 
 import logging
+import os
 import re
 
 from fastmcp import FastMCP
@@ -885,8 +891,31 @@ Step 5 — Summarize: new threats? increased activity from known sources? agents
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 
+# The transport is env-selectable so the same server runs as a local stdio child
+# (the default, byte-for-byte the previous behaviour) or over streamable-HTTP so
+# it can be served behind a gateway. Only the entry point branches; every tool is
+# identical on both transports.
+#
+# HTTP exposes the tools to any client that can reach the socket. The default bind
+# is loopback; a routable deployment must sit behind an authenticating proxy, or
+# enable FastMCP token auth, before binding a public address. No shared secret is
+# enforced here, so HTTP must not be exposed directly to an untrusted network.
 def main():
-    mcp.run()
+    transport = os.environ.get("MCP_TRANSPORT", "stdio").strip().lower()
+    if transport == "stdio":
+        mcp.run()
+        return
+    if transport != "http":
+        raise SystemExit(
+            f"MCP_TRANSPORT={transport!r} is not supported; use 'stdio' or 'http'."
+        )
+    host = os.environ.get("MCP_HTTP_HOST", "127.0.0.1").strip()
+    port_raw = os.environ.get("MCP_HTTP_PORT", "8080").strip()
+    try:
+        port = int(port_raw)
+    except ValueError:
+        raise SystemExit(f"MCP_HTTP_PORT={port_raw!r} is not an integer.")
+    mcp.run(transport="http", host=host, port=port)
 
 
 if __name__ == "__main__":
