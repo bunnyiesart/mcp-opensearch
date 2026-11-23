@@ -47,7 +47,6 @@ Transport (env vars):
 import logging
 import os
 import re
-from typing import Optional
 
 from fastmcp import FastMCP
 
@@ -146,8 +145,8 @@ def opensearch_get_mapping(index: str) -> dict:
 def opensearch_discover_fields(
     index: str,
     query_string: str = "*",
-    from_ts: Optional[str] = None,
-    to_ts: Optional[str] = None,
+    from_ts: str | None = None,
+    to_ts: str | None = None,
     ts_field: str = "@timestamp",
     sample_size: int = 10,
 ) -> dict:
@@ -184,14 +183,14 @@ def opensearch_discover_fields(
 def opensearch_search(
     index: str,
     query_string: str = "*",
-    from_ts: Optional[str] = None,
-    to_ts: Optional[str] = None,
+    from_ts: str | None = None,
+    to_ts: str | None = None,
     ts_field: str = "@timestamp",
     limit: int = 50,
     offset: int = 0,
-    sort_field: Optional[str] = None,
+    sort_field: str | None = None,
     sort_dir: str = "desc",
-    source_fields: Optional[list] = None,
+    source_fields: list | None = None,
 ) -> dict:
     """Full-document retrieval using Lucene syntax (same as the Dashboards search bar).
 
@@ -236,8 +235,8 @@ def opensearch_search(
 def opensearch_count(
     index: str,
     query_string: str = "*",
-    from_ts: Optional[str] = None,
-    to_ts: Optional[str] = None,
+    from_ts: str | None = None,
+    to_ts: str | None = None,
     ts_field: str = "@timestamp",
 ) -> dict:
     """Fastest way to check how many documents match a condition; never returns content.
@@ -269,12 +268,12 @@ def opensearch_timeline(
     index: str,
     entity: str,
     fields: list,
-    from_ts: Optional[str] = None,
-    to_ts: Optional[str] = None,
+    from_ts: str | None = None,
+    to_ts: str | None = None,
     ts_field: str = "@timestamp",
     limit: int = 100,
-    source_fields: Optional[list] = None,
-    extra_query: Optional[str] = None,
+    source_fields: list | None = None,
+    extra_query: str | None = None,
 ) -> dict:
     """Build a chronological event timeline for a single entity (IP, user, host) across fields.
 
@@ -320,8 +319,8 @@ def opensearch_terms(
     index: str,
     field: str,
     query_string: str = "*",
-    from_ts: Optional[str] = None,
-    to_ts: Optional[str] = None,
+    from_ts: str | None = None,
+    to_ts: str | None = None,
     ts_field: str = "@timestamp",
     size: int = 50,
 ) -> dict:
@@ -359,8 +358,8 @@ def opensearch_multi_terms(
     index: str,
     aggregations: list,
     query_string: str = "*",
-    from_ts: Optional[str] = None,
-    to_ts: Optional[str] = None,
+    from_ts: str | None = None,
+    to_ts: str | None = None,
     ts_field: str = "@timestamp",
 ) -> dict:
     """Preferred over calling opensearch_terms in a loop — single round-trip for multiple fields.
@@ -436,8 +435,8 @@ def opensearch_stats(
     index: str,
     field: str,
     query_string: str = "*",
-    from_ts: Optional[str] = None,
-    to_ts: Optional[str] = None,
+    from_ts: str | None = None,
+    to_ts: str | None = None,
     ts_field: str = "@timestamp",
 ) -> dict:
     """Min/max/avg/std for a numeric field. Only works on numeric types (integer, float, long).
@@ -607,8 +606,8 @@ def opensearch_list_monitors(size: int = 50) -> list:
 
 @mcp.tool()
 def opensearch_get_alerts(
-    state: Optional[str] = None,
-    monitor_id: Optional[str] = None,
+    state: str | None = None,
+    monitor_id: str | None = None,
     size: int = 50,
 ) -> dict:
     """Fetch alerts raised by Alerting-plugin monitors — the "what is firing right now?" tool.
@@ -650,9 +649,9 @@ def opensearch_list_detectors(size: int = 50) -> list:
 
 @mcp.tool()
 def opensearch_get_anomaly_results(
-    detector_id: Optional[str] = None,
-    from_ts: Optional[str] = None,
-    to_ts: Optional[str] = None,
+    detector_id: str | None = None,
+    from_ts: str | None = None,
+    to_ts: str | None = None,
     min_grade: float = 0.0,
     size: int = 50,
 ) -> dict:
