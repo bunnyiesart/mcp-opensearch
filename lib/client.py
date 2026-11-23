@@ -219,7 +219,7 @@ class OpenSearchClient:
                     "Dashboards returned HTTP %s — trying direct OpenSearch",
                     r.status_code,
                 )
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 — probe/fallback: any failure moves to the next backend
                 logger.warning("Dashboards unreachable (%s) — trying direct OpenSearch", exc)
 
         if self.opensearch_url:
@@ -238,7 +238,7 @@ class OpenSearchClient:
                     self.opensearch_url, self.server_version,
                 )
                 return
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 — probe/fallback: any failure moves to the next backend
                 logger.error("Direct OpenSearch also unreachable: %s", exc)
 
         raise RuntimeError(
@@ -248,7 +248,7 @@ class OpenSearchClient:
 
     # ── Low-level requests ────────────────────────────────────
 
-    def _get(self, path: str, params: dict = None) -> dict:
+    def _get(self, path: str, params: dict | None = None) -> dict:
         self._check_path("GET", path)
         self._resolve_backend()
         if self.backend == BACKEND_DASHBOARDS:
@@ -263,7 +263,7 @@ class OpenSearchClient:
         self.last_query_ms = int(r.elapsed.total_seconds() * 1000)
         return r.json()
 
-    def _post(self, path: str, body: dict = None, params: dict = None) -> dict:
+    def _post(self, path: str, body: dict | None = None, params: dict | None = None) -> dict:
         self._check_path("POST", path)
         self._resolve_backend()
         if self.backend == BACKEND_DASHBOARDS:
@@ -280,7 +280,7 @@ class OpenSearchClient:
         return r.json()
 
     def _dashboards_proxy(
-        self, method: str, path: str, body: dict = None, params: dict = None
+        self, method: str, path: str, body: dict | None = None, params: dict | None = None
     ) -> dict:
         """Route an OpenSearch request through Dashboards /api/console/proxy."""
         os_path = path.lstrip("/")
@@ -429,8 +429,8 @@ class OpenSearchClient:
         self,
         index: str,
         query_string: str = "*",
-        from_ts: str = None,
-        to_ts: str = None,
+        from_ts: str | None = None,
+        to_ts: str | None = None,
         ts_field: str = "@timestamp",
         sample_size: int = 10,
     ) -> dict:
@@ -463,14 +463,14 @@ class OpenSearchClient:
         self,
         index: str,
         query_string: str = "*",
-        from_ts: str = None,
-        to_ts: str = None,
+        from_ts: str | None = None,
+        to_ts: str | None = None,
         ts_field: str = "@timestamp",
         limit: int = 50,
         offset: int = 0,
-        sort_field: str = None,
+        sort_field: str | None = None,
         sort_dir: str = "desc",
-        source_fields: list = None,
+        source_fields: list | None = None,
     ) -> dict:
         """Search with a Lucene query string. Returns {"total": N, "hits": [...]}.
 
@@ -511,12 +511,12 @@ class OpenSearchClient:
         index: str,
         entity: str,
         fields: list,
-        from_ts: str = None,
-        to_ts: str = None,
+        from_ts: str | None = None,
+        to_ts: str | None = None,
         ts_field: str = "@timestamp",
         limit: int = 100,
-        source_fields: list = None,
-        extra_query: str = None,
+        source_fields: list | None = None,
+        extra_query: str | None = None,
     ) -> dict:
         """Chronological event timeline for one entity across multiple fields.
 
@@ -555,8 +555,8 @@ class OpenSearchClient:
         self,
         index: str,
         query_string: str = "*",
-        from_ts: str = None,
-        to_ts: str = None,
+        from_ts: str | None = None,
+        to_ts: str | None = None,
         ts_field: str = "@timestamp",
     ) -> dict:
         """Count documents matching a query. Returns {"count": N}.
@@ -575,8 +575,8 @@ class OpenSearchClient:
         index: str,
         field: str,
         query_string: str = "*",
-        from_ts: str = None,
-        to_ts: str = None,
+        from_ts: str | None = None,
+        to_ts: str | None = None,
         ts_field: str = "@timestamp",
         size: int = 50,
     ) -> dict:
@@ -607,8 +607,8 @@ class OpenSearchClient:
         index: str,
         aggregations: list,
         query_string: str = "*",
-        from_ts: str = None,
-        to_ts: str = None,
+        from_ts: str | None = None,
+        to_ts: str | None = None,
         ts_field: str = "@timestamp",
     ) -> dict:
         """Multiple field frequency analyses in one call.
@@ -723,8 +723,8 @@ class OpenSearchClient:
         index: str,
         field: str,
         query_string: str = "*",
-        from_ts: str = None,
-        to_ts: str = None,
+        from_ts: str | None = None,
+        to_ts: str | None = None,
         ts_field: str = "@timestamp",
     ) -> dict:
         """Numeric stats (count, min, max, avg, sum, std_deviation) for a field."""
@@ -756,7 +756,7 @@ class OpenSearchClient:
 
     # ── Bypass methods (caller owns path validation) ──────────
 
-    def raw_get(self, path: str, params: dict = None) -> dict:
+    def raw_get(self, path: str, params: dict | None = None) -> dict:
         """GET any path, bypassing the read-only allowlist. Caller owns validation."""
         self._resolve_backend()
         if self.backend == BACKEND_DASHBOARDS:
@@ -771,7 +771,7 @@ class OpenSearchClient:
         self.last_query_ms = int(r.elapsed.total_seconds() * 1000)
         return r.json()
 
-    def raw_post(self, path: str, body: dict = None, params: dict = None) -> dict:
+    def raw_post(self, path: str, body: dict | None = None, params: dict | None = None) -> dict:
         """POST any path, bypassing the read-only allowlist. Caller owns validation."""
         self._resolve_backend()
         if self.backend == BACKEND_DASHBOARDS:
@@ -836,8 +836,8 @@ class OpenSearchClient:
 
     def get_alerts(
         self,
-        state: str = None,
-        monitor_id: str = None,
+        state: str | None = None,
+        monitor_id: str | None = None,
         size: int = 50,
     ) -> dict:
         """Fetch alerts raised by Alerting-plugin monitors.
@@ -891,9 +891,9 @@ class OpenSearchClient:
 
     def get_anomaly_results(
         self,
-        detector_id: str = None,
-        from_ts: str = None,
-        to_ts: str = None,
+        detector_id: str | None = None,
+        from_ts: str | None = None,
+        to_ts: str | None = None,
         min_grade: float = 0.0,
         size: int = 50,
     ) -> dict:
